@@ -37,8 +37,11 @@ if [[ -t 1 ]]; then
   C_CYAN='\033[36m'
   C_BOLD_WHITE='\033[1;37m'
   C_GRAY='\033[90m'
+  C_GREEN='\033[32m'
+  C_YELLOW='\033[33m'
+  C_RED='\033[31m'
 else
-  C_RESET='' C_CYAN='' C_BOLD_WHITE='' C_GRAY=''
+  C_RESET='' C_CYAN='' C_BOLD_WHITE='' C_GRAY='' C_GREEN='' C_YELLOW='' C_RED=''
 fi
 
 # ---- Root 权限检测 ----
@@ -51,6 +54,33 @@ require_root() {
     echo -e "\n${C_CYAN}此功能需要 root 权限，请使用 sudo 或以 root 用户运行${C_RESET}"
     return 1
   fi
+}
+
+# ---- 对齐提示框（自动计算 CJK 宽字符）----
+print_box() {
+  local lines=("$@")
+  local max_dw=0 dw
+
+  for line in "${lines[@]}"; do
+    dw=$(printf '%s' "$line" | wc -L | tr -d ' ')
+    (( dw > max_dw )) && max_dw=$dw
+  done
+
+  local inner_w=$((max_dw + 4))
+  local border
+  border=$(printf '═%.0s' $(seq 1 $inner_w))
+
+  echo ""
+  echo -e "  ${C_YELLOW}╔${border}╗${C_RESET}"
+  for line in "${lines[@]}"; do
+    dw=$(printf '%s' "$line" | wc -L | tr -d ' ')
+    local pad=$((max_dw - dw))
+    local pad_str
+    pad_str=$(printf '%*s' "$pad" '')
+    echo -e "  ${C_YELLOW}║${C_RESET}  ${C_BOLD_WHITE}${line}${C_RESET}${pad_str}  ${C_YELLOW}║${C_RESET}"
+  done
+  echo -e "  ${C_YELLOW}╚${border}╝${C_RESET}"
+  echo ""
 }
 
 # 写入结果键值对到 results.dat
@@ -489,47 +519,49 @@ upload_test() {
 #  1) SSH 安全加固
 # ============================================================
 do_ssh_harden() {
-  echo -e "${C_CYAN}=== SSH 安全加固 ===${C_RESET}"
+  echo -e "\n${C_BOLD_WHITE}━━━━━━━━━━ SSH 安全加固 ━━━━━━━━━━${C_RESET}\n"
 
-  # --- 1. 获取新端口 ---
+  # --- [1/6] 获取新端口 ---
+  echo -e "${C_CYAN}[1/6] 设置 SSH 端口${C_RESET}"
   local new_port
-  read -rp "请输入新的 SSH 端口 [默认 2222]: " new_port
+  read -rp "      请输入新的 SSH 端口 [默认 2222]: " new_port
   new_port="${new_port:-2222}"
 
   if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-    echo "端口无效，请输入 1-65535 之间的数字"
+    echo -e "      ${C_RED}✗ 端口无效，请输入 1-65535 之间的数字${C_RESET}"
     return 1
   fi
+  echo -e "      ${C_GREEN}✓ 端口设置为 ${new_port}${C_RESET}\n"
 
-  # --- 2. 获取公钥 ---
-  echo ""
-  echo "请粘贴你的 SSH 公钥（以 ssh-rsa / ssh-ed25519 / ecdsa-sha2 开头）："
+  # --- [2/6] 获取公钥并写入 ---
+  echo -e "${C_CYAN}[2/6] 配置 SSH 公钥${C_RESET}"
+  echo "      请粘贴你的 SSH 公钥（以 ssh-rsa / ssh-ed25519 / ecdsa-sha2 开头）："
   local pubkey
   read -r pubkey
 
   if ! [[ "$pubkey" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2|ssh-dss)[[:space:]] ]]; then
-    echo "公钥格式无效，请检查后重试"
+    echo -e "      ${C_RED}✗ 公钥格式无效，请检查后重试${C_RESET}"
     return 1
   fi
 
-  # --- 3. 写入 authorized_keys ---
   local ssh_dir="$HOME/.ssh"
   mkdir -p "$ssh_dir"
   chmod 700 "$ssh_dir"
 
   if grep -qF "$pubkey" "$ssh_dir/authorized_keys" 2>/dev/null; then
-    echo "该公钥已存在于 authorized_keys 中，跳过写入"
+    echo -e "      ${C_YELLOW}● 该公钥已存在，跳过写入${C_RESET}\n"
   else
     echo "$pubkey" >> "$ssh_dir/authorized_keys"
     chmod 600 "$ssh_dir/authorized_keys"
-    echo "公钥已写入 $ssh_dir/authorized_keys"
+    echo -e "      ${C_GREEN}✓ 公钥已写入 ${ssh_dir}/authorized_keys${C_RESET}\n"
   fi
 
-  # --- 4. 备份并修改 sshd_config ---
+  # --- [3/6] 备份并修改 sshd_config ---
+  echo -e "${C_CYAN}[3/6] 修改 SSH 配置${C_RESET}"
   local sshd_config="/etc/ssh/sshd_config"
   local backup="${sshd_config}.bak.$(date +%Y%m%d%H%M%S)"
   cp "$sshd_config" "$backup"
-  echo "已备份 sshd_config → $backup"
+  echo -e "      ${C_GREEN}✓ 已备份 → ${backup}${C_RESET}"
 
   sed -i \
     -e "s/^#\?Port .*/Port ${new_port}/" \
@@ -544,47 +576,51 @@ do_ssh_harden() {
   grep -q "^PasswordAuthentication " "$sshd_config" || echo "PasswordAuthentication no" >> "$sshd_config"
   grep -q "^PermitRootLogin " "$sshd_config" || echo "PermitRootLogin prohibit-password" >> "$sshd_config"
 
-  echo "sshd_config 已更新：Port=${new_port}, 密钥登录, 禁用密码"
+  echo -e "      ${C_GREEN}✓ Port=${new_port}, 密钥登录, 禁用密码${C_RESET}\n"
 
-  # --- 5. Ubuntu 特殊处理：ssh.socket ---
+  # --- [4/6] Ubuntu ssh.socket ---
+  echo -e "${C_CYAN}[4/6] 检查 Ubuntu ssh.socket${C_RESET}"
   local socket_file="/lib/systemd/system/ssh.socket"
   if [[ -f "$socket_file" ]]; then
-    echo "检测到 Ubuntu ssh.socket，同步修改端口..."
     local socket_backup="${socket_file}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$socket_file" "$socket_backup"
     sed -i "s/^ListenStream=.*/ListenStream=${new_port}/" "$socket_file"
     systemctl daemon-reload
-    echo "ssh.socket 已更新并重载 daemon"
+    echo -e "      ${C_GREEN}✓ ssh.socket 已更新端口并重载 daemon${C_RESET}\n"
+  else
+    echo -e "      ${C_GRAY}─ 未检测到 ssh.socket，跳过${C_RESET}\n"
   fi
 
-  # --- 6. 配置 ufw ---
+  # --- [5/6] 配置 ufw ---
+  echo -e "${C_CYAN}[5/6] 配置防火墙${C_RESET}"
   if command -v ufw &>/dev/null; then
-    echo "配置防火墙..."
     ufw allow "${new_port}/tcp"
     ufw --force enable
-    echo "ufw 已放行端口 ${new_port}/tcp"
+    echo -e "      ${C_GREEN}✓ ufw 已放行端口 ${new_port}/tcp${C_RESET}\n"
   else
-    echo -e "${C_CYAN}提示：未检测到 ufw，请手动配置防火墙放行端口 ${new_port}${C_RESET}"
+    echo -e "      ${C_YELLOW}⚠ 未检测到 ufw，请手动配置防火墙放行端口 ${new_port}${C_RESET}\n"
   fi
 
-  # --- 7. 重启 SSH 服务 ---
+  # --- [6/6] 重启 SSH 服务 ---
+  echo -e "${C_CYAN}[6/6] 重启 SSH 服务${C_RESET}"
   if systemctl is-active --quiet sshd 2>/dev/null; then
     systemctl restart sshd
+    echo -e "      ${C_GREEN}✓ sshd 已重启${C_RESET}"
   elif systemctl is-active --quiet ssh 2>/dev/null; then
     systemctl restart ssh
+    echo -e "      ${C_GREEN}✓ ssh 已重启${C_RESET}"
   else
-    echo "警告：无法确定 SSH 服务名，请手动重启 SSH 服务"
+    echo -e "      ${C_YELLOW}⚠ 无法确定 SSH 服务名，请手动重启${C_RESET}"
   fi
 
-  # --- 8. 醒目提示 ---
-  echo ""
-  echo -e "${C_BOLD_WHITE}╔══════════════════════════════════════════════════════════╗${C_RESET}"
-  echo -e "${C_BOLD_WHITE}║  ⚠  重要提示                                           ║${C_RESET}"
-  echo -e "${C_BOLD_WHITE}║  请用新端口 ${new_port} 新开一个终端测试 SSH 连接          ║${C_RESET}"
-  echo -e "${C_BOLD_WHITE}║  确认能正常登录后，再关闭当前会话！                      ║${C_RESET}"
-  echo -e "${C_BOLD_WHITE}║  ssh -p ${new_port} root@<服务器IP>                       ║${C_RESET}"
-  echo -e "${C_BOLD_WHITE}╚══════════════════════════════════════════════════════════╝${C_RESET}"
-  echo ""
+  # --- 完成提示框 ---
+  print_box \
+    "⚠  重要提示" \
+    "" \
+    "请用新端口 ${new_port} 新开一个终端测试 SSH 连接" \
+    "确认能正常登录后，再关闭当前会话！" \
+    "" \
+    "ssh -p ${new_port} root@<服务器IP>"
 }
 
 # ============================================================
