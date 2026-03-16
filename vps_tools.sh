@@ -772,17 +772,22 @@ do_speedtest() {
   RESULTS_FILE="${tmpdir}/results.dat"
   TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 
+  echo -e "\n${C_BOLD_WHITE}━━━━━━━━━━ Cloudflare 测速 ━━━━━━━━━━${C_RESET}\n"
+
   write_result "MEAS_ID" "$MEAS_ID"
   write_result "TIMESTAMP" "\"$TIMESTAMP\""
   write_result "TARGET" "$BASE"
   write_result "IPV4_FORCED" "yes"
 
   # 1) Idle latency
+  echo -ne "   ${C_CYAN}[1/3]${C_RESET} 测量空闲延迟 (${LAT_SAMPLES} 个采样点)..."
   local lat_idle="${tmpdir}/lat_idle.txt"
   latency_collect "${BASE}/__down?bytes=0&measId=${MEAS_ID}" "$LAT_SAMPLES" "$LAT_INTERVAL" "$lat_idle"
   latency_summary "$lat_idle" "IDLE_LAT" "idle latency"
+  echo -e " ${C_GREEN}✓${C_RESET}"
 
   # 2) Download (+ optional loaded latency during download)
+  echo -ne "   ${C_CYAN}[2/3]${C_RESET} 下载测试 (${DL_N}×$(awk -v b="$DL_BYTES" 'BEGIN{printf "%.0fMB", b/1000000}'))..."
   if [[ "$MEASURE_LOADED_LATENCY" == "1" ]]; then
     local lat_d="${tmpdir}/lat_dload.txt"
     latency_collect "${BASE}/__down?bytes=0&during=download&measId=${MEAS_ID}" "$LAT_SAMPLES" "$LAT_INTERVAL" "$lat_d" &
@@ -795,8 +800,10 @@ do_speedtest() {
     wait "$pid_d" || true
     latency_summary "$lat_d" "DL_LAT" "download latency"
   fi
+  echo -e " ${C_GREEN}✓${C_RESET}"
 
   # 3) Upload (+ optional loaded latency during upload)
+  echo -ne "   ${C_CYAN}[3/3]${C_RESET} 上传测试 (${UP_N} 次)..."
   if [[ "$MEASURE_LOADED_LATENCY" == "1" ]]; then
     local lat_u="${tmpdir}/lat_uload.txt"
     latency_collect "${BASE}/__down?bytes=0&during=upload&measId=${MEAS_ID}" "$LAT_SAMPLES" "$LAT_INTERVAL" "$lat_u" &
@@ -809,9 +816,954 @@ do_speedtest() {
     wait "$pid_u" || true
     latency_summary "$lat_u" "UP_LAT" "upload latency"
   fi
+  echo -e " ${C_GREEN}✓${C_RESET}"
 
+  echo ""
   render_terminal
   render_html
+}
+
+# ============================================================
+#  8) 防火墙管理 (ufw)
+# ============================================================
+
+# 获取当前 SSH 端口
+_get_ssh_port() {
+  local port
+  port="$(grep -E '^Port ' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)"
+  echo "${port:-22}"
+}
+
+# 确保 ufw 已安装
+_ensure_ufw() {
+  if command -v ufw &>/dev/null; then
+    return 0
+  fi
+  echo -ne "   安装 ufw..."
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y -qq ufw >/dev/null 2>&1
+  if command -v ufw &>/dev/null; then
+    echo -e " ${C_GREEN}✓${C_RESET}"
+    return 0
+  else
+    echo -e " ${C_RED}✗ 安装失败${C_RESET}"
+    return 1
+  fi
+}
+
+# 验证端口或端口范围格式
+_validate_port() {
+  local input="$1"
+  # 单端口: 1-65535
+  if [[ "$input" =~ ^[0-9]+$ ]]; then
+    (( input >= 1 && input <= 65535 )) && return 0
+  fi
+  # 端口范围: start:end
+  if [[ "$input" =~ ^([0-9]+):([0-9]+)$ ]]; then
+    local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+    (( s >= 1 && s <= 65535 && e >= 1 && e <= 65535 && s <= e )) && return 0
+  fi
+  return 1
+}
+
+# 交互选择协议
+_ask_protocol() {
+  echo "   选择协议："
+  echo "     1) tcp"
+  echo "     2) udp"
+  echo "     3) tcp+udp (两者都开)"
+  local proto_choice
+  read -rp "   请选择 [默认 3]: " proto_choice
+  proto_choice="${proto_choice:-3}"
+  case "$proto_choice" in
+    1) echo "tcp" ;;
+    2) echo "udp" ;;
+    *) echo "both" ;;
+  esac
+}
+
+# 子功能：开启防火墙
+_fw_enable() {
+  local ssh_port
+  ssh_port="$(_get_ssh_port)"
+
+  echo -e "   ${C_YELLOW}● 检测到当前 SSH 端口: ${ssh_port}${C_RESET}"
+  echo -e "   ${C_YELLOW}● 开启前将自动放行该端口，防止连接中断${C_RESET}"
+  echo ""
+  read -rp "   确认开启防火墙？[y/N]: " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo -e "   ${C_YELLOW}● 已取消${C_RESET}"
+    return 0
+  fi
+
+  ufw allow "${ssh_port}/tcp" >/dev/null 2>&1
+  echo -e "   ${C_GREEN}✓ 已放行 SSH 端口 ${ssh_port}/tcp${C_RESET}"
+
+  ufw --force enable >/dev/null 2>&1
+  echo -e "   ${C_GREEN}✓ 防火墙已开启${C_RESET}"
+}
+
+# 子功能：关闭防火墙
+_fw_disable() {
+  read -rp "   确认关闭防火墙？[y/N]: " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo -e "   ${C_YELLOW}● 已取消${C_RESET}"
+    return 0
+  fi
+  ufw disable >/dev/null 2>&1
+  echo -e "   ${C_GREEN}✓ 防火墙已关闭${C_RESET}"
+}
+
+# 子功能：开放端口
+_fw_allow() {
+  local port proto
+  read -rp "   请输入端口号或范围 (如 443 或 8000:9000): " port
+  if ! _validate_port "$port"; then
+    echo -e "   ${C_RED}✗ 端口格式无效${C_RESET}"
+    return 1
+  fi
+
+  proto="$(_ask_protocol)"
+  echo ""
+
+  if [[ "$proto" == "both" ]]; then
+    ufw allow "$port" >/dev/null 2>&1
+    echo -e "   ${C_GREEN}✓ 已开放 ${port}/tcp+udp${C_RESET}"
+  else
+    ufw allow "${port}/${proto}" >/dev/null 2>&1
+    echo -e "   ${C_GREEN}✓ 已开放 ${port}/${proto}${C_RESET}"
+  fi
+}
+
+# 子功能：关闭端口
+_fw_deny() {
+  local port proto
+  read -rp "   请输入端口号或范围 (如 443 或 8000:9000): " port
+  if ! _validate_port "$port"; then
+    echo -e "   ${C_RED}✗ 端口格式无效${C_RESET}"
+    return 1
+  fi
+
+  proto="$(_ask_protocol)"
+  echo ""
+
+  if [[ "$proto" == "both" ]]; then
+    ufw deny "$port" >/dev/null 2>&1
+    echo -e "   ${C_GREEN}✓ 已关闭 ${port}/tcp+udp${C_RESET}"
+  else
+    ufw deny "${port}/${proto}" >/dev/null 2>&1
+    echo -e "   ${C_GREEN}✓ 已关闭 ${port}/${proto}${C_RESET}"
+  fi
+}
+
+# 子功能：查看当前规则
+_fw_status() {
+  echo -e "   ${C_CYAN}当前防火墙规则：${C_RESET}"
+  echo ""
+  ufw status numbered
+}
+
+# 子功能：删除指定规则
+_fw_delete() {
+  echo -e "   ${C_CYAN}当前防火墙规则：${C_RESET}"
+  echo ""
+  ufw status numbered
+  echo ""
+
+  local rule_num
+  read -rp "   请输入要删除的规则编号: " rule_num
+  if ! [[ "$rule_num" =~ ^[0-9]+$ ]] || (( rule_num < 1 )); then
+    echo -e "   ${C_RED}✗ 编号无效${C_RESET}"
+    return 1
+  fi
+
+  read -rp "   确认删除规则 #${rule_num}？[y/N]: " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo -e "   ${C_YELLOW}● 已取消${C_RESET}"
+    return 0
+  fi
+
+  yes | ufw delete "$rule_num" >/dev/null 2>&1
+  echo -e "   ${C_GREEN}✓ 规则 #${rule_num} 已删除${C_RESET}"
+}
+
+# 子功能：重置防火墙
+_fw_reset() {
+  echo -e "   ${C_RED}⚠ 这将清除所有防火墙规则并禁用防火墙！${C_RESET}"
+  read -rp "   确认重置？[y/N]: " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo -e "   ${C_YELLOW}● 已取消${C_RESET}"
+    return 0
+  fi
+
+  yes | ufw reset >/dev/null 2>&1
+  echo -e "   ${C_GREEN}✓ 防火墙已重置${C_RESET}"
+}
+
+do_firewall() {
+  _ensure_ufw || return 1
+
+  while true; do
+    echo -e "\n${C_BOLD_WHITE}━━━━━━━━━━ 防火墙管理 (ufw) ━━━━━━━━━━${C_RESET}\n"
+
+    # 显示当前状态
+    local fw_status
+    fw_status="$(ufw status | head -n1)"
+    if [[ "$fw_status" == *"active"* ]]; then
+      echo -e "   状态: ${C_GREEN}● 已开启${C_RESET}"
+    else
+      echo -e "   状态: ${C_RED}● 未开启${C_RESET}"
+    fi
+    echo ""
+
+    echo " 1) 开启防火墙"
+    echo " 2) 关闭防火墙"
+    echo " 3) 开放端口"
+    echo " 4) 关闭端口"
+    echo " 5) 查看当前规则"
+    echo " 6) 删除指定规则"
+    echo " 7) 重置防火墙"
+    echo " 0) 返回主菜单"
+    echo ""
+
+    local fw_choice
+    read -rp "请输入选项 [0-7]: " fw_choice
+    echo ""
+    case "$fw_choice" in
+      1) _fw_enable ;;
+      2) _fw_disable ;;
+      3) _fw_allow ;;
+      4) _fw_deny ;;
+      5) _fw_status ;;
+      6) _fw_delete ;;
+      7) _fw_reset ;;
+      0) return 0 ;;
+      *) echo "   无效选项" ;;
+    esac
+  done
+}
+
+# ============================================================
+#  9) 端口转发 (nftables)
+# ============================================================
+
+NFT_CONF_DIR="/etc/nftables.d"
+NFT_CONF_FILE="${NFT_CONF_DIR}/port-forward.conf"
+NFT_BACKUP_DIR="${NFT_CONF_DIR}/backups"
+NFT_MAIN_CONF="/etc/nftables.conf"
+NFT_SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
+NFT_LOG_FILE="/var/log/nft-forward.log"
+NFT_LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
+NFT_TABLE_NAME="port_forward"
+declare -a NFT_RULES=()
+
+_nft_validate_port() {
+  local port="$1"
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^0[0-9] ]]; then
+    return 1
+  fi
+  (( port >= 1 && port <= 65535 ))
+}
+
+_nft_validate_ip() {
+  local ip="$1"
+  if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then return 1; fi
+  if [[ "$ip" =~ (^|\.)0[0-9] ]]; then return 1; fi
+  local IFS='.'
+  read -ra octets <<< "$ip"
+  for octet in "${octets[@]}"; do
+    (( octet > 255 )) && return 1
+  done
+  return 0
+}
+
+_nft_get_local_ip() {
+  local ip
+  ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1) || true
+  if [[ -n "$ip" ]]; then echo "$ip"; return; fi
+  ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1) || true
+  if [[ -n "$ip" ]]; then echo "$ip"; return; fi
+  hostname -I 2>/dev/null | awk '{print $1}' || true
+}
+
+# 用法: _nft_firewall_port open|close <lport> <dest_ip> <dport> [force]
+_nft_firewall_port() {
+  local action="$1" lport="$2" dest_ip="$3" dport="$4" force="${5:-}"
+
+  if [[ "$action" == "open" ]]; then
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      firewall-cmd --add-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --add-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      echo -e "${C_GREEN}[信息]${C_RESET} 已在 firewalld 中放行端口 ${lport} (tcp+udp)。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] firewalld 放行端口 ${lport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      return
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+      ufw allow "${lport}/tcp" >/dev/null 2>&1 || true
+      ufw allow "${lport}/udp" >/dev/null 2>&1 || true
+      ufw route allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+      ufw route allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+      echo -e "${C_GREEN}[信息]${C_RESET} 已在 UFW 中放行端口 ${lport} 及转发到 ${dest_ip}:${dport} (tcp+udp)。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] UFW 放行端口 ${lport} 转发到 ${dest_ip}:${dport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      return
+    fi
+    if command -v iptables &>/dev/null && iptables -S &>/dev/null; then
+      iptables -C INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+      iptables -C INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+      iptables -C FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+      iptables -C FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+      iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+      echo -e "${C_GREEN}[信息]${C_RESET} 已在 iptables 中放行: INPUT ${lport}, FORWARD → ${dest_ip}:${dport} (tcp+udp)。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] iptables 放行 INPUT:${lport} FORWARD:${dest_ip}:${dport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      local _persisted=false
+      if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1 && _persisted=true
+      fi
+      if ! $_persisted && command -v iptables-save &>/dev/null; then
+        if [[ -d /etc/iptables ]]; then
+          iptables-save > /etc/iptables/rules.v4 2>/dev/null && _persisted=true
+        elif [[ -d /etc/sysconfig ]]; then
+          iptables-save > /etc/sysconfig/iptables 2>/dev/null && _persisted=true
+        fi
+      fi
+      if ! $_persisted && command -v service &>/dev/null; then
+        service iptables save >/dev/null 2>&1 && _persisted=true
+      fi
+      if ! $_persisted; then
+        echo -e "${C_YELLOW}[警告]${C_RESET} iptables 规则已生效但未能自动持久化，重启后可能丢失。"
+      fi
+    fi
+  else
+    # --- close ---
+    local _still_used=false
+    if [[ "$force" != "force" ]]; then
+      local _rule _lp _di _dp
+      for _rule in "${NFT_RULES[@]}"; do
+        IFS='|' read -r _lp _di _dp <<< "$_rule"
+        [[ "$_lp" == "$lport" ]] && continue
+        if [[ "$_di" == "$dest_ip" && "$_dp" == "$dport" ]]; then
+          _still_used=true; break
+        fi
+      done
+    fi
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      firewall-cmd --remove-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --remove-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      echo -e "${C_GREEN}[信息]${C_RESET} 已从 firewalld 中移除端口 ${lport} 的放行规则。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] firewalld 移除端口 ${lport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      return
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+      yes | ufw delete allow "${lport}/tcp" >/dev/null 2>&1 || true
+      yes | ufw delete allow "${lport}/udp" >/dev/null 2>&1 || true
+      if ! $_still_used; then
+        yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+      fi
+      echo -e "${C_GREEN}[信息]${C_RESET} 已从 UFW 中移除端口 ${lport} 的放行规则。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] UFW 移除端口 ${lport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      return
+    fi
+    if command -v iptables &>/dev/null && iptables -S &>/dev/null; then
+      iptables -D INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+      if ! $_still_used; then
+        iptables -D FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+      fi
+      echo -e "${C_GREEN}[信息]${C_RESET} 已从 iptables 中移除: INPUT ${lport}, FORWARD → ${dest_ip}:${dport}。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] iptables 移除 INPUT:${lport} FORWARD:${dest_ip}:${dport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+      elif command -v iptables-save &>/dev/null; then
+        if [[ -d /etc/iptables ]]; then iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        elif [[ -d /etc/sysconfig ]]; then iptables-save > /etc/sysconfig/iptables 2>/dev/null
+        fi
+      elif command -v service &>/dev/null; then
+        service iptables save >/dev/null 2>&1
+      fi
+    fi
+  fi
+}
+
+_nft_init_conf() {
+  mkdir -p "$NFT_CONF_DIR" "$NFT_BACKUP_DIR" 2>/dev/null || {
+    echo -e "${C_RED}[错误]${C_RESET} 无法创建配置目录 ${NFT_CONF_DIR}，请检查权限。"
+    return 1
+  }
+  touch "$NFT_LOG_FILE" 2>/dev/null || true
+  if [[ ! -f "$NFT_LOGROTATE_CONF" ]]; then
+    cat > "$NFT_LOGROTATE_CONF" <<'LOGROTATE'
+/var/log/nft-forward.log {
+    monthly
+    rotate 6
+    compress
+    missingok
+    notifempty
+}
+LOGROTATE
+  fi
+  if [[ ! -f "$NFT_MAIN_CONF" ]]; then
+    cat > "$NFT_MAIN_CONF" <<'NFTCONF'
+#!/usr/sbin/nft -f
+include "/etc/nftables.d/*.conf"
+NFTCONF
+    echo -e "${C_GREEN}[信息]${C_RESET} 已创建 ${NFT_MAIN_CONF}。"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 创建 ${NFT_MAIN_CONF}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  elif ! grep -qF 'include "/etc/nftables.d/*.conf"' "$NFT_MAIN_CONF" 2>/dev/null; then
+    echo 'include "/etc/nftables.d/*.conf"' >> "$NFT_MAIN_CONF"
+    echo -e "${C_GREEN}[信息]${C_RESET} 已在 ${NFT_MAIN_CONF} 中添加 include 指令。"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 在 ${NFT_MAIN_CONF} 中添加 include 指令" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  fi
+  if [[ ! -f "$NFT_CONF_FILE" ]]; then
+    _nft_save_and_reload no-reload || return 1
+  fi
+}
+
+_nft_load_rules() {
+  NFT_RULES=()
+  [[ ! -f "$NFT_CONF_FILE" ]] && return
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
+      NFT_RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}")
+    fi
+  done < "$NFT_CONF_FILE"
+}
+
+_nft_save_and_reload() {
+  local skip_reload="${1:-}"
+  # backup
+  if [[ -f "$NFT_CONF_FILE" ]]; then
+    cp "$NFT_CONF_FILE" "${NFT_BACKUP_DIR}/port-forward.conf.$(date '+%Y%m%d_%H%M%S')" 2>/dev/null || true
+  fi
+  # write
+  local local_ip
+  local_ip=$(_nft_get_local_ip)
+  if [[ -z "$local_ip" ]]; then
+    echo -e "${C_RED}[错误]${C_RESET} 无法获取本机 IP 地址，请检查网络配置。"
+    return 1
+  fi
+  local tmp_file="${NFT_CONF_FILE}.tmp.$$"
+  cat > "$tmp_file" <<EOF
+#!/usr/sbin/nft -f
+
+# --- 本机 IP（自动获取，用于 SNAT 回源）
+define LOCAL_IP = ${local_ip}
+
+table ip ${NFT_TABLE_NAME} {
+    # --- PREROUTING (DNAT) ---
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+EOF
+  local rule lport dip dport
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r lport dip dport <<< "$rule"
+    cat >> "$tmp_file" <<EOF
+
+        # 转发: 本机:${lport} -> ${dip}:${dport}
+        tcp dport ${lport} dnat to ${dip}:${dport}
+        udp dport ${lport} dnat to ${dip}:${dport}
+EOF
+  done
+  cat >> "$tmp_file" <<EOF
+    }
+
+    # --- POSTROUTING (SNAT) ---
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+EOF
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r lport dip dport <<< "$rule"
+    cat >> "$tmp_file" <<EOF
+
+        # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为本机 IP
+        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP
+        ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP
+EOF
+  done
+  cat >> "$tmp_file" <<EOF
+    }
+}
+EOF
+  mv -f "$tmp_file" "$NFT_CONF_FILE" 2>/dev/null || {
+    echo -e "${C_RED}[错误]${C_RESET} 无法写入配置文件 ${NFT_CONF_FILE}"
+    rm -f "$tmp_file" 2>/dev/null || true
+    return 1
+  }
+  # reload
+  if [[ "$skip_reload" != "no-reload" ]]; then
+    nft flush table ip "$NFT_TABLE_NAME" 2>/dev/null || true
+    nft delete table ip "$NFT_TABLE_NAME" 2>/dev/null || true
+    if ! nft -f "$NFT_CONF_FILE"; then
+      echo -e "${C_RED}[错误]${C_RESET} 加载配置文件失败，请检查 ${NFT_CONF_FILE}"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+_nft_setup_kernel() {
+  local current
+  current=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || current="0"
+  if [[ "$current" != "1" ]]; then
+    if sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 已开启 IPv4 转发。"
+    else
+      echo -e "${C_YELLOW}[警告]${C_RESET} 无法开启 IPv4 转发，请手动执行: sysctl -w net.ipv4.ip_forward=1"
+    fi
+  fi
+  mkdir -p "$(dirname "$NFT_SYSCTL_CONF")" 2>/dev/null || true
+  touch "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  if grep -qE '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=' "$NFT_SYSCTL_CONF" 2>/dev/null; then
+    sed -i -E 's|^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=.*|net.ipv4.ip_forward=1|' "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  else
+    echo "net.ipv4.ip_forward=1" >> "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  fi
+  sysctl -p "$NFT_SYSCTL_CONF" >/dev/null 2>&1 || true
+  # BBR + fq
+  modprobe tcp_bbr 2>/dev/null || true
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    echo -e "${C_YELLOW}[警告]${C_RESET} 内核不支持 BBR，已跳过。"
+    return 0
+  fi
+  local cur_cc cur_qd
+  cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cur_cc=""
+  cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || cur_qd=""
+  if [[ "$cur_cc" == "bbr" && "$cur_qd" == "fq" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} BBR + fq 已启用（无需修改）。"
+    return 0
+  fi
+  sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+  cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cur_cc=""
+  cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || cur_qd=""
+  if [[ "$cur_cc" == "bbr" && "$cur_qd" == "fq" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 已开启 BBR + fq。"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开启 BBR+fq" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  else
+    echo -e "${C_YELLOW}[警告]${C_RESET} 尝试开启 BBR+fq 后未确认生效（当前: cc=${cur_cc:-?}, qdisc=${cur_qd:-?}）。"
+  fi
+  if grep -qE '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "$NFT_SYSCTL_CONF"; then
+    sed -i -E 's|^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=.*|net.core.default_qdisc=fq|' "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  else
+    echo "net.core.default_qdisc=fq" >> "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  fi
+  if grep -qE '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "$NFT_SYSCTL_CONF"; then
+    sed -i -E 's/^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=.*/net.ipv4.tcp_congestion_control=bbr/' "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  else
+    echo "net.ipv4.tcp_congestion_control=bbr" >> "$NFT_SYSCTL_CONF" 2>/dev/null || true
+  fi
+  sysctl -p "$NFT_SYSCTL_CONF" >/dev/null 2>&1 || true
+  echo -e "${C_GREEN}[信息]${C_RESET} 已持久化 BBR + fq 到 ${NFT_SYSCTL_CONF}。"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 持久化 BBR+fq 到 ${NFT_SYSCTL_CONF}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+}
+
+_nft_do_install() {
+  echo ""
+  if command -v nft &>/dev/null; then
+    echo -e "${C_GREEN}[信息]${C_RESET} nftables 已安装。"
+    nft --version 2>/dev/null || true
+    echo ""
+    echo -e "${C_YELLOW}[警告]${C_RESET} 安装将清空所有已有 nftables 配置，由本脚本统一接管。"
+    echo -e "${C_YELLOW}[警告]${C_RESET} 已有的配置文件将被备份（重命名为 .bak）。"
+    read -rp "是否继续？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
+      return 0
+    fi
+    local ts
+    ts=$(date '+%Y%m%d_%H%M%S')
+    if [[ -f "$NFT_MAIN_CONF" ]]; then
+      mv "$NFT_MAIN_CONF" "${NFT_MAIN_CONF}.bak.${ts}" 2>/dev/null || true
+      echo -e "${C_GREEN}[信息]${C_RESET} 已备份 ${NFT_MAIN_CONF} → ${NFT_MAIN_CONF}.bak.${ts}"
+    fi
+    if [[ -d "$NFT_CONF_DIR" ]]; then
+      local f
+      for f in "${NFT_CONF_DIR}"/*.conf; do
+        [[ -f "$f" ]] || continue
+        mv "$f" "${f}.bak.${ts}" 2>/dev/null || true
+        echo -e "${C_GREEN}[信息]${C_RESET} 已备份 ${f} → ${f}.bak.${ts}"
+      done
+    fi
+    nft flush ruleset 2>/dev/null || true
+    echo -e "${C_GREEN}[信息]${C_RESET} 已清空当前 nftables 规则集。"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 清空已有配置并由脚本接管 (备份时间戳: ${ts})" >> "$NFT_LOG_FILE" 2>/dev/null || true
+    _nft_setup_kernel
+    # 检测防火墙状态
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 检测到 firewalld 正在运行，添加转发规则时将自动放行对应端口。"
+    elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 检测到 UFW 正在运行，添加转发规则时将自动放行对应端口。"
+    elif command -v iptables &>/dev/null && iptables -S &>/dev/null; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 检测到 iptables 规则集存在，添加转发规则时将自动放行对应端口。"
+    fi
+    _nft_init_conf
+    if ! nft -f "$NFT_MAIN_CONF"; then
+      echo -e "${C_RED}[错误]${C_RESET} 加载 ${NFT_MAIN_CONF} 失败，请检查配置。"
+      return 1
+    fi
+    if systemctl enable --now nftables 2>/dev/null; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 已启用 nftables 服务。"
+    else
+      echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务启用失败，请手动执行: systemctl enable --now nftables"
+    fi
+    echo -e "${C_GREEN}[信息]${C_RESET} 初始化完成，所有配置已由本脚本接管。"
+    return 0
+  fi
+
+  echo -e "${C_GREEN}[信息]${C_RESET} 未检测到 nftables，准备安装..."
+  local pkg_mgr="unknown"
+  if command -v apt-get &>/dev/null; then pkg_mgr="apt"
+  elif command -v dnf &>/dev/null; then pkg_mgr="dnf"
+  elif command -v yum &>/dev/null; then pkg_mgr="yum"
+  elif command -v pacman &>/dev/null; then pkg_mgr="pacman"
+  fi
+  case "$pkg_mgr" in
+    apt) apt-get update -y && apt-get install -y nftables ;;
+    dnf) dnf install -y nftables ;;
+    yum) yum install -y nftables ;;
+    pacman) pacman -Sy --noconfirm nftables ;;
+    *) echo -e "${C_RED}[错误]${C_RESET} 无法识别包管理器，请手动安装 nftables。"; return 1 ;;
+  esac
+  if ! command -v nft &>/dev/null; then
+    echo -e "${C_RED}[错误]${C_RESET} 安装失败，请手动安装 nftables。"
+    return 1
+  fi
+  echo -e "${C_GREEN}[信息]${C_RESET} nftables 安装成功。"
+  nft --version 2>/dev/null || true
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装 nftables" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  _nft_setup_kernel
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 检测到 firewalld 正在运行，添加转发规则时将自动放行对应端口。"
+  elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 检测到 UFW 正在运行，添加转发规则时将自动放行对应端口。"
+  elif command -v iptables &>/dev/null && iptables -S &>/dev/null; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 检测到 iptables 规则集存在，添加转发规则时将自动放行对应端口。"
+  fi
+  _nft_init_conf
+  if systemctl enable --now nftables 2>/dev/null; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 已启用 nftables 服务。"
+  else
+    echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务启用失败，请手动执行: systemctl enable --now nftables"
+  fi
+  echo -e "${C_GREEN}[信息]${C_RESET} 安装与初始化完成。"
+}
+
+_nft_do_list() {
+  echo ""
+  _nft_load_rules
+  if [[ ${#NFT_RULES[@]} -eq 0 ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 当前没有端口转发规则。"
+    return
+  fi
+  printf "\n\033[1m%-6s %-10s %-10s    %-22s\033[0m\n" "序号" "协议" "本机端口" "目标地址"
+  echo "──────────────────────────────────────────────────────"
+  local idx=1 rule lport dip dport
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r lport dip dport <<< "$rule"
+    printf "%-6s %-10s %-10s -> %-22s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
+    ((idx++))
+  done
+  echo ""
+}
+
+_nft_do_add() {
+  echo ""
+  if ! command -v nft &>/dev/null; then
+    echo -e "${C_RED}[错误]${C_RESET} nftables 未安装，请先选择 [1] 安装。"
+    return
+  fi
+  _nft_init_conf || return
+  _nft_setup_kernel
+  _nft_load_rules
+  local local_ip
+  local_ip=$(_nft_get_local_ip)
+  if [[ -z "$local_ip" ]]; then
+    echo -e "${C_RED}[错误]${C_RESET} 无法获取本机 IP 地址，请检查网络配置。"
+    return
+  fi
+  local lport
+  while true; do
+    read -rp "请输入本机监听端口 (1-65535): " lport
+    if _nft_validate_port "$lport"; then break; fi
+    echo -e "${C_RED}[错误]${C_RESET} 端口无效，请输入 1-65535 之间的数字。"
+  done
+  local rule rp
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r rp _ _ <<< "$rule"
+    if [[ "$rp" == "$lport" ]]; then
+      echo -e "${C_RED}[错误]${C_RESET} 本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
+      return
+    fi
+  done
+  # 端口占用检测（内联）
+  local conflict=""
+  if ss -tlnp 2>/dev/null | grep -qE ":${lport}\b"; then conflict="TCP"; fi
+  if ss -ulnp 2>/dev/null | grep -qE ":${lport}\b"; then
+    [[ -n "$conflict" ]] && conflict="TCP+UDP" || conflict="UDP"
+  fi
+  if [[ -n "$conflict" ]]; then
+    echo -e "${C_YELLOW}[警告]${C_RESET} 本机端口 ${lport} 已被其他服务占用（${conflict}）。"
+    echo -e "${C_YELLOW}[警告]${C_RESET} 添加转发后，该端口的外部流量将被转发，本地服务可能无法从外部访问。"
+    read -rp "是否仍要继续添加转发规则？[y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
+      return
+    fi
+  fi
+  local dip
+  while true; do
+    read -rp "请输入目标 IP 地址: " dip
+    if _nft_validate_ip "$dip"; then break; fi
+    echo -e "${C_RED}[错误]${C_RESET} IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
+  done
+  local dport
+  while true; do
+    read -rp "请输入目标端口 (1-65535) [默认: ${lport}]: " dport
+    dport="${dport:-$lport}"
+    if _nft_validate_port "$dport"; then break; fi
+    echo -e "${C_RED}[错误]${C_RESET} 端口无效，请输入 1-65535 之间的数字。"
+  done
+  echo ""
+  echo "即将添加转发规则:"
+  echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+  read -rp "确认添加？[Y/n]: " confirm
+  if [[ "$confirm" =~ ^[Nn]$ ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
+    return
+  fi
+  NFT_RULES+=("${lport}|${dip}|${dport}")
+  if ! _nft_save_and_reload; then return; fi
+  _nft_firewall_port open "$lport" "$dip" "$dport"
+  echo -e "${C_GREEN}[信息]${C_RESET} 转发规则添加成功: ${lport} → ${dip}:${dport}"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 新增转发: ${lport} -> ${dip}:${dport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  echo -e "${C_GREEN}[信息]${C_RESET} 若转发不通，请使用菜单中的【诊断/自检】排查。"
+}
+
+_nft_do_delete() {
+  echo ""
+  if ! command -v nft &>/dev/null; then
+    echo -e "${C_RED}[错误]${C_RESET} nftables 未安装，请先选择 [1] 安装。"
+    return
+  fi
+  _nft_load_rules
+  if [[ ${#NFT_RULES[@]} -eq 0 ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 当前没有端口转发规则，无需删除。"
+    return
+  fi
+  printf "\n\033[1m%-6s %-10s %-10s    %-20s\033[0m\n" "序号" "协议" "本机端口" "目标地址"
+  echo "────────────────────────────────────────────────────"
+  local idx=1 rule lport dip dport
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r lport dip dport <<< "$rule"
+    printf "%-6s %-10s %-10s -> %-20s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
+    ((idx++))
+  done
+  echo ""
+  local choice
+  read -rp "请输入要删除的序号 (0 取消): " choice
+  if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
+    return
+  fi
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#NFT_RULES[@]} )); then
+    echo -e "${C_RED}[错误]${C_RESET} 无效的序号。"
+    return
+  fi
+  local target="${NFT_RULES[$((choice-1))]}"
+  IFS='|' read -r lport dip dport <<< "$target"
+  echo "即将删除转发规则:"
+  echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+  read -rp "确认删除？[Y/n]: " confirm
+  if [[ "$confirm" =~ ^[Nn]$ ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
+    return
+  fi
+  unset 'NFT_RULES[$((choice-1))]'
+  NFT_RULES=("${NFT_RULES[@]}")
+  if ! _nft_save_and_reload; then return; fi
+  _nft_firewall_port close "$lport" "$dip" "$dport"
+  echo -e "${C_GREEN}[信息]${C_RESET} 转发规则已删除: ${lport} → ${dip}:${dport}"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除转发: ${lport} -> ${dip}:${dport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+}
+
+_nft_do_clear_all() {
+  echo ""
+  if ! command -v nft &>/dev/null; then
+    echo -e "${C_RED}[错误]${C_RESET} nftables 未安装，请先选择 [1] 安装。"
+    return
+  fi
+  _nft_load_rules
+  if [[ ${#NFT_RULES[@]} -eq 0 ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 当前没有端口转发规则，无需清空。"
+    return
+  fi
+  echo -e "${C_YELLOW}[警告]${C_RESET} 即将清空全部 ${#NFT_RULES[@]} 条转发规则！"
+  read -rp "确认清空？[y/N]: " confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
+    return
+  fi
+  local rule lport dip dport
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r lport dip dport <<< "$rule"
+    _nft_firewall_port close "$lport" "$dip" "$dport" "force"
+  done
+  NFT_RULES=()
+  if ! _nft_save_and_reload; then return; fi
+  echo -e "${C_GREEN}[信息]${C_RESET} 所有转发规则已清空。"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 清空所有转发规则" >> "$NFT_LOG_FILE" 2>/dev/null || true
+}
+
+_nft_do_diagnose() {
+  echo ""
+  echo "========================================"
+  echo "           诊断 / 自检"
+  echo "========================================"
+  local ip_fwd
+  ip_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || ip_fwd="未知"
+  if [[ "$ip_fwd" == "1" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} IPv4 转发: 已开启"
+  else
+    echo -e "${C_RED}[错误]${C_RESET} IPv4 转发: 未开启 (当前值: ${ip_fwd})"
+    echo "  → 修复: 选择菜单【安装 nftables】会自动开启"
+  fi
+  if command -v nft &>/dev/null; then
+    echo -e "${C_GREEN}[信息]${C_RESET} nftables: 已安装 ($(nft --version 2>/dev/null || echo '未知版本'))"
+  else
+    echo -e "${C_RED}[错误]${C_RESET} nftables: 未安装"
+    echo "  → 修复: 选择菜单【安装 nftables】"
+  fi
+  local svc_enabled svc_active
+  svc_enabled=$(systemctl is-enabled nftables 2>/dev/null) || svc_enabled="unknown"
+  svc_active=$(systemctl is-active nftables 2>/dev/null) || svc_active="unknown"
+  if [[ "$svc_enabled" == "enabled" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} nftables 开机启动: 是"
+  else
+    echo -e "${C_YELLOW}[警告]${C_RESET} nftables 开机启动: 否（重启后规则可能丢失）"
+    echo "  → 修复: systemctl enable nftables"
+  fi
+  if [[ "$svc_active" == "active" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} nftables 服务状态: 运行中"
+  else
+    echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务状态: 未运行"
+    echo "  → 修复: systemctl start nftables"
+  fi
+  if nft list table ip "$NFT_TABLE_NAME" &>/dev/null; then
+    _nft_load_rules
+    echo -e "${C_GREEN}[信息]${C_RESET} 转发规则表: 已加载（${#NFT_RULES[@]} 条转发规则）"
+  else
+    echo -e "${C_YELLOW}[警告]${C_RESET} 转发规则表: 未加载（可能无规则或服务未启动）"
+  fi
+  echo ""
+  echo "--- 防火墙状态 ---"
+  local fw_found=false
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    fw_found=true
+    echo -e "${C_GREEN}[信息]${C_RESET} firewalld: 活跃"
+  fi
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+    fw_found=true
+    echo -e "${C_YELLOW}[警告]${C_RESET} UFW: 活跃（默认会阻止入站连接，可能影响转发）"
+  fi
+  if ! $fw_found && command -v iptables &>/dev/null && iptables -S &>/dev/null; then
+    fw_found=true
+    local fwd_policy
+    fwd_policy=$(iptables -S FORWARD 2>/dev/null | grep -- '^-P FORWARD' | awk '{print $3}') || fwd_policy=""
+    if [[ "$fwd_policy" == "DROP" || "$fwd_policy" == "REJECT" ]]; then
+      echo -e "${C_YELLOW}[警告]${C_RESET} iptables FORWARD 默认策略: ${fwd_policy}（可能阻止转发流量）"
+    else
+      echo -e "${C_GREEN}[信息]${C_RESET} iptables FORWARD 默认策略: ${fwd_policy:-ACCEPT}"
+    fi
+  fi
+  if ! $fw_found; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 未检测到活跃的防火墙 (firewalld / UFW / iptables)"
+  fi
+  echo ""
+  echo "--- nftables forward 链 ---"
+  local fwd_chains
+  fwd_chains=$(nft list chains 2>/dev/null | grep -B1 "hook forward" || true)
+  if [[ -n "$fwd_chains" ]]; then
+    if echo "$fwd_chains" | grep -qi "drop"; then
+      echo -e "${C_YELLOW}[警告]${C_RESET} 检测到 nftables 存在 forward 链默认策略为 drop"
+      echo "  这会阻止所有转发流量，需手动添加放行规则。"
+      echo "  查看详情: nft list ruleset | grep -A5 'hook forward'"
+    else
+      echo -e "${C_GREEN}[信息]${C_RESET} nftables forward 链: 未发现 drop 策略"
+    fi
+  else
+    echo -e "${C_GREEN}[信息]${C_RESET} 未检测到 nftables forward 链（正常，不影响转发）"
+  fi
+  echo ""
+  echo "--- 配置持久化 ---"
+  if [[ -f "$NFT_MAIN_CONF" ]]; then
+    if grep -qF 'include "/etc/nftables.d/*.conf"' "$NFT_MAIN_CONF" 2>/dev/null; then
+      echo -e "${C_GREEN}[信息]${C_RESET} 主配置 ${NFT_MAIN_CONF}: 已包含 include 指令"
+    else
+      echo -e "${C_YELLOW}[警告]${C_RESET} 主配置 ${NFT_MAIN_CONF}: 缺少 include 指令（重启后规则可能丢失）"
+      echo "  → 修复: 选择菜单【安装 nftables】会自动添加"
+    fi
+  else
+    echo -e "${C_YELLOW}[警告]${C_RESET} 主配置 ${NFT_MAIN_CONF}: 不存在（重启后规则可能丢失）"
+    echo "  → 修复: 选择菜单【安装 nftables】会自动创建"
+  fi
+  if [[ -f "$NFT_CONF_FILE" ]]; then
+    echo -e "${C_GREEN}[信息]${C_RESET} 转发配置文件: ${NFT_CONF_FILE} 存在"
+  else
+    echo -e "${C_GREEN}[信息]${C_RESET} 转发配置文件: 尚未创建（添加首条规则时自动生成）"
+  fi
+  echo ""
+  _nft_load_rules
+  if [[ ${#NFT_RULES[@]} -gt 0 ]]; then
+    read -rp "是否测试目标连通性？[y/N]: " test_conn
+    if [[ "$test_conn" =~ ^[Yy]$ ]]; then
+      local rule lport dip dport
+      for rule in "${NFT_RULES[@]}"; do
+        IFS='|' read -r lport dip dport <<< "$rule"
+        printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
+        if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
+          printf "${C_GREEN}通${C_RESET}\n"
+        else
+          printf "${C_RED}不通或超时${C_RESET}\n"
+        fi
+      done
+    fi
+  fi
+  echo ""
+}
+
+do_nft_forward() {
+  while true; do
+    echo -e "\n${C_BOLD_WHITE}━━━━━━━━━━ 端口转发 (nftables) ━━━━━━━━━━${C_RESET}\n"
+    echo " 1) 安装 nftables"
+    echo " 2) 查看现有端口转发"
+    echo " 3) 新增端口转发"
+    echo " 4) 删除端口转发"
+    echo " 5) 一键清空所有转发"
+    echo " 6) 诊断/自检"
+    echo " 0) 返回主菜单"
+    echo ""
+    local nft_choice
+    read -rp "请选择操作 [0-6]: " nft_choice
+    case "$nft_choice" in
+      1) _nft_do_install ;;
+      2) _nft_do_list ;;
+      3) _nft_do_add ;;
+      4) _nft_do_delete ;;
+      5) _nft_do_clear_all ;;
+      6) _nft_do_diagnose ;;
+      0) return 0 ;;
+      *) echo -e "${C_RED}[错误]${C_RESET} 无效选择，请输入 0-6。" ;;
+    esac
+  done
 }
 
 # ============================================================
@@ -829,6 +1781,8 @@ show_menu() {
   echo " 5) Snell 安装"
   echo " 6) 清理备份文件"
   echo " 7) Cloudflare 测速"
+  echo " 8) 防火墙管理"
+  echo " 9) 端口转发 (nftables)"
   echo " 0) 退出"
   echo -e "${C_CYAN}=========================================${C_RESET}"
 }
@@ -836,7 +1790,7 @@ show_menu() {
 main() {
   while true; do
     show_menu
-    read -rp "请输入选项 [0-7]: " choice
+    read -rp "请输入选项 [0-9]: " choice
     echo ""
     case "$choice" in
       1) require_root && do_ssh_harden || true ;;
@@ -846,6 +1800,8 @@ main() {
       5) require_root && do_snell_install || true ;;
       6) require_root && do_cleanup_backups || true ;;
       7) do_speedtest || true ;;
+      8) require_root && do_firewall || true ;;
+      9) require_root && do_nft_forward || true ;;
       0) echo "再见！"; exit 0 ;;
       *) echo "无效选项，请重新输入" ;;
     esac
