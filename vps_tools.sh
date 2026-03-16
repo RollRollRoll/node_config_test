@@ -1009,7 +1009,7 @@ do_firewall() {
     # 显示当前状态
     local fw_status
     fw_status="$(ufw status | head -n1)"
-    if [[ "$fw_status" == *"active"* ]]; then
+    if [[ "$fw_status" == *"active"* && "$fw_status" != *"inactive"* ]]; then
       echo -e "   状态: ${C_GREEN}● 已开启${C_RESET}"
     else
       echo -e "   状态: ${C_RED}● 未开启${C_RESET}"
