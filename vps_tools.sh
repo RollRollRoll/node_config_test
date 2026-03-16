@@ -1765,6 +1765,57 @@ do_nft_forward() {
 }
 
 # ============================================================
+#  10) 修改主机名
+# ============================================================
+do_change_hostname() {
+  local current_hostname
+  current_hostname=$(hostname)
+  echo -e "${C_CYAN}=== 修改主机名 ===${C_RESET}"
+  echo ""
+  echo -e "当前主机名: ${C_BOLD_WHITE}${current_hostname}${C_RESET}"
+  echo ""
+
+  local new_hostname
+  read -rp "请输入新的主机名 (留空取消): " new_hostname
+
+  # 留空取消
+  if [[ -z "$new_hostname" ]]; then
+    echo "已取消"
+    return 0
+  fi
+
+  # 校验主机名格式: 仅允许字母、数字、连字符，不能以连字符开头或结尾
+  if ! [[ "$new_hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+    echo -e "${C_CYAN}主机名格式无效${C_RESET}"
+    echo "规则: 仅允许字母、数字、连字符，不能以连字符开头或结尾，最长63字符"
+    return 1
+  fi
+
+  echo ""
+  read -rp "确认将主机名修改为 '${new_hostname}'? [y/N]: " confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "已取消"
+    return 0
+  fi
+
+  # 使用 hostnamectl 设置主机名
+  if command -v hostnamectl &>/dev/null; then
+    hostnamectl set-hostname "$new_hostname"
+  else
+    echo "$new_hostname" > /etc/hostname
+    hostname "$new_hostname"
+  fi
+
+  # 更新 /etc/hosts 中旧主机名的映射
+  if grep -q "$current_hostname" /etc/hosts; then
+    sed -i "s/$current_hostname/$new_hostname/g" /etc/hosts
+  fi
+
+  echo ""
+  echo -e "${C_CYAN}主机名已修改为:${C_RESET} ${C_BOLD_WHITE}$(hostname)${C_RESET}"
+}
+
+# ============================================================
 #  主菜单
 # ============================================================
 show_menu() {
@@ -1773,14 +1824,15 @@ show_menu() {
   echo -e "${C_BOLD_WHITE}         VPS Tools v1.0${C_RESET}"
   echo -e "${C_CYAN}=========================================${C_RESET}"
   echo " 1) SSH 安全加固"
-  echo " 2) 系统更新"
-  echo " 3) 安装Nezha探针 (Nezha Agent)"
-  echo " 4) 服务器质量检测 (NodeQuality)"
+  echo " 2) 修改主机名"
+  echo " 3) 系统更新"
+  echo " 4) 安装Nezha探针 (Nezha Agent)"
   echo " 5) Snell 安装"
-  echo " 6) 清理备份文件"
-  echo " 7) Cloudflare 测速"
-  echo " 8) 防火墙管理"
-  echo " 9) 端口转发 (nftables)"
+  echo " 6) 防火墙管理"
+  echo " 7) 端口转发 (nftables)"
+  echo " 8) 服务器质量检测 (NodeQuality)"
+  echo " 9) Cloudflare 测速"
+  echo " 10) 清理备份文件"
   echo " 0) 退出"
   echo -e "${C_CYAN}=========================================${C_RESET}"
 }
@@ -1788,18 +1840,19 @@ show_menu() {
 main() {
   while true; do
     show_menu
-    read -rp "请输入选项 [0-9]: " choice
+    read -rp "请输入选项 [0-10]: " choice
     echo ""
     case "$choice" in
       1) require_root && do_ssh_harden || true ;;
-      2) require_root && do_system_update || true ;;
-      3) require_root && do_nezha_install || true ;;
-      4) do_node_quality || true ;;
+      2) require_root && do_change_hostname || true ;;
+      3) require_root && do_system_update || true ;;
+      4) require_root && do_nezha_install || true ;;
       5) require_root && do_snell_install || true ;;
-      6) require_root && do_cleanup_backups || true ;;
-      7) do_speedtest || true ;;
-      8) require_root && do_firewall || true ;;
-      9) require_root && do_nft_forward || true ;;
+      6) require_root && do_firewall || true ;;
+      7) require_root && do_nft_forward || true ;;
+      8) do_node_quality || true ;;
+      9) do_speedtest || true ;;
+      10) require_root && do_cleanup_backups || true ;;
       0) echo "再见！"; exit 0 ;;
       *) echo "无效选项，请重新输入" ;;
     esac
