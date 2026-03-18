@@ -866,6 +866,48 @@ _validate_port() {
   return 1
 }
 
+# 验证 IP 地址或 CIDR 网段
+_validate_ip_or_cidr() {
+  local input="$1"
+  local ip prefix
+
+  # 分离 IP 和 CIDR 前缀长度
+  if [[ "$input" == */* ]]; then
+    ip="${input%/*}"
+    prefix="${input#*/}"
+    # 前缀长度必须是 0-32 的数字
+    if ! [[ "$prefix" =~ ^[0-9]+$ ]] || (( prefix > 32 )); then
+      return 1
+    fi
+  else
+    ip="$input"
+  fi
+
+  # 验证 IP 格式
+  if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then return 1; fi
+  if [[ "$ip" =~ (^|\.)0[0-9] ]]; then return 1; fi
+  local IFS='.'
+  read -ra octets <<< "$ip"
+  for octet in "${octets[@]}"; do
+    (( octet > 255 )) && return 1
+  done
+  return 0
+}
+
+# 交互询问来源 IP（可选）
+_ask_source_ip() {
+  echo "   来源 IP 限制（留空表示允许所有来源）：" >&2
+  echo "     支持单个 IP (如 1.2.3.4) 或 CIDR 网段 (如 10.0.0.0/8)" >&2
+  local src_ip
+  read -rp "   请输入来源 IP [默认 any]: " src_ip
+  src_ip="${src_ip// /}"
+  if [[ -z "$src_ip" ]]; then
+    echo ""
+  else
+    echo "$src_ip"
+  fi
+}
+
 # 交互选择协议
 _ask_protocol() {
   echo "   选择协议：" >&2
@@ -916,7 +958,7 @@ _fw_disable() {
 
 # 子功能：开放端口
 _fw_allow() {
-  local port proto
+  local port proto src_ip
   read -rp "   请输入端口号或范围 (如 443 或 8000:9000): " port
   if ! _validate_port "$port"; then
     echo -e "   ${C_RED}✗ 端口格式无效${C_RESET}"
@@ -924,20 +966,38 @@ _fw_allow() {
   fi
 
   proto="$(_ask_protocol)"
+  src_ip="$(_ask_source_ip)"
+
+  if [[ -n "$src_ip" ]] && ! _validate_ip_or_cidr "$src_ip"; then
+    echo -e "   ${C_RED}✗ IP 地址格式无效${C_RESET}"
+    return 1
+  fi
   echo ""
 
-  if [[ "$proto" == "both" ]]; then
-    ufw allow "$port" >/dev/null 2>&1
-    echo -e "   ${C_GREEN}✓ 已开放 ${port}/tcp+udp${C_RESET}"
+  if [[ -z "$src_ip" ]]; then
+    # 无来源限制
+    if [[ "$proto" == "both" ]]; then
+      ufw allow "$port" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已开放 ${port}/tcp+udp${C_RESET}"
+    else
+      ufw allow "${port}/${proto}" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已开放 ${port}/${proto}${C_RESET}"
+    fi
   else
-    ufw allow "${port}/${proto}" >/dev/null 2>&1
-    echo -e "   ${C_GREEN}✓ 已开放 ${port}/${proto}${C_RESET}"
+    # 指定来源 IP
+    if [[ "$proto" == "both" ]]; then
+      ufw allow from "$src_ip" to any port "$port" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已开放 ${port}/tcp+udp (来源: ${src_ip})${C_RESET}"
+    else
+      ufw allow from "$src_ip" to any port "$port" proto "$proto" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已开放 ${port}/${proto} (来源: ${src_ip})${C_RESET}"
+    fi
   fi
 }
 
 # 子功能：关闭端口
 _fw_deny() {
-  local port proto
+  local port proto src_ip
   read -rp "   请输入端口号或范围 (如 443 或 8000:9000): " port
   if ! _validate_port "$port"; then
     echo -e "   ${C_RED}✗ 端口格式无效${C_RESET}"
@@ -945,14 +1005,32 @@ _fw_deny() {
   fi
 
   proto="$(_ask_protocol)"
+  src_ip="$(_ask_source_ip)"
+
+  if [[ -n "$src_ip" ]] && ! _validate_ip_or_cidr "$src_ip"; then
+    echo -e "   ${C_RED}✗ IP 地址格式无效${C_RESET}"
+    return 1
+  fi
   echo ""
 
-  if [[ "$proto" == "both" ]]; then
-    ufw deny "$port" >/dev/null 2>&1
-    echo -e "   ${C_GREEN}✓ 已关闭 ${port}/tcp+udp${C_RESET}"
+  if [[ -z "$src_ip" ]]; then
+    # 无来源限制
+    if [[ "$proto" == "both" ]]; then
+      ufw deny "$port" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已关闭 ${port}/tcp+udp${C_RESET}"
+    else
+      ufw deny "${port}/${proto}" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已关闭 ${port}/${proto}${C_RESET}"
+    fi
   else
-    ufw deny "${port}/${proto}" >/dev/null 2>&1
-    echo -e "   ${C_GREEN}✓ 已关闭 ${port}/${proto}${C_RESET}"
+    # 指定来源 IP
+    if [[ "$proto" == "both" ]]; then
+      ufw deny from "$src_ip" to any port "$port" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已关闭 ${port}/tcp+udp (来源: ${src_ip})${C_RESET}"
+    else
+      ufw deny from "$src_ip" to any port "$port" proto "$proto" >/dev/null 2>&1
+      echo -e "   ${C_GREEN}✓ 已关闭 ${port}/${proto} (来源: ${src_ip})${C_RESET}"
+    fi
   fi
 }
 
