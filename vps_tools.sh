@@ -1162,9 +1162,9 @@ _nft_get_local_ip() {
   hostname -I 2>/dev/null | awk '{print $1}' || true
 }
 
-# 用法: _nft_firewall_port open|close <lport> <dest_ip> <dport> [force]
+# 用法: _nft_firewall_port open|close <lport> <dest_ip> <dport> [src_ip] [force]
 _nft_firewall_port() {
-  local action="$1" lport="$2" dest_ip="$3" dport="$4" force="${5:-}"
+  local action="$1" lport="$2" dest_ip="$3" dport="$4" src_ip="${5:-}" force="${6:-}"
 
   if [[ "$action" == "open" ]]; then
     if systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -1176,12 +1176,21 @@ _nft_firewall_port() {
       return
     fi
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
-      ufw allow "${lport}/tcp" >/dev/null 2>&1 || true
-      ufw allow "${lport}/udp" >/dev/null 2>&1 || true
-      ufw route allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
-      ufw route allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
-      echo -e "${C_GREEN}[信息]${C_RESET} 已在 UFW 中放行端口 ${lport} 及转发到 ${dest_ip}:${dport} (tcp+udp)。"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] UFW 放行端口 ${lport} 转发到 ${dest_ip}:${dport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+      local _src_info=""
+      if [[ -n "$src_ip" ]]; then
+        ufw allow from "$src_ip" to any port "${lport}" proto tcp >/dev/null 2>&1 || true
+        ufw allow from "$src_ip" to any port "${lport}" proto udp >/dev/null 2>&1 || true
+        ufw route allow proto tcp from "$src_ip" to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        ufw route allow proto udp from "$src_ip" to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        _src_info=" (来源: ${src_ip})"
+      else
+        ufw allow "${lport}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${lport}/udp" >/dev/null 2>&1 || true
+        ufw route allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        ufw route allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+      fi
+      echo -e "${C_GREEN}[信息]${C_RESET} 已在 UFW 中放行端口 ${lport} 及转发到 ${dest_ip}:${dport} (tcp+udp)${_src_info}。"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] UFW 放行端口 ${lport} 转发到 ${dest_ip}:${dport}${_src_info}" >> "$NFT_LOG_FILE" 2>/dev/null || true
       return
     fi
     if command -v iptables &>/dev/null && iptables -S &>/dev/null; then
@@ -1219,9 +1228,9 @@ _nft_firewall_port() {
     # --- close ---
     local _still_used=false
     if [[ "$force" != "force" ]]; then
-      local _rule _lp _di _dp
+      local _rule _lp _di _dp _
       for _rule in "${NFT_RULES[@]}"; do
-        IFS='|' read -r _lp _di _dp <<< "$_rule"
+        IFS='|' read -r _lp _di _dp _ _ <<< "$_rule"
         [[ "$_lp" == "$lport" ]] && continue
         if [[ "$_di" == "$dest_ip" && "$_dp" == "$dport" ]]; then
           _still_used=true; break
@@ -1237,11 +1246,20 @@ _nft_firewall_port() {
       return
     fi
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
-      yes | ufw delete allow "${lport}/tcp" >/dev/null 2>&1 || true
-      yes | ufw delete allow "${lport}/udp" >/dev/null 2>&1 || true
-      if ! $_still_used; then
-        yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
-        yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+      if [[ -n "$src_ip" ]]; then
+        yes | ufw delete allow from "$src_ip" to any port "${lport}" proto tcp >/dev/null 2>&1 || true
+        yes | ufw delete allow from "$src_ip" to any port "${lport}" proto udp >/dev/null 2>&1 || true
+        if ! $_still_used; then
+          yes | ufw route delete allow proto tcp from "$src_ip" to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+          yes | ufw route delete allow proto udp from "$src_ip" to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        fi
+      else
+        yes | ufw delete allow "${lport}/tcp" >/dev/null 2>&1 || true
+        yes | ufw delete allow "${lport}/udp" >/dev/null 2>&1 || true
+        if ! $_still_used; then
+          yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+          yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        fi
       fi
       echo -e "${C_GREEN}[信息]${C_RESET} 已从 UFW 中移除端口 ${lport} 的放行规则。"
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] UFW 移除端口 ${lport}" >> "$NFT_LOG_FILE" 2>/dev/null || true
@@ -1306,18 +1324,29 @@ NFTCONF
 _nft_load_rules() {
   NFT_RULES=()
   [[ ! -f "$NFT_CONF_FILE" ]] && return
-  local _comment=""
+  local _comment="" _src_ip=""
   while IFS= read -r line; do
-    if [[ "$line" =~ ^[[:space:]]*#.*\|\ *备注:\ *(.*) ]]; then
-      _comment="${BASH_REMATCH[1]}"
+    if [[ "$line" =~ ^[[:space:]]*#\ *转发: ]]; then
+      _comment=""
+      _src_ip=""
+      if [[ "$line" =~ \|\ *备注:\ *([^|]*) ]]; then
+        _comment="${BASH_REMATCH[1]}"
+        _comment="${_comment% }"
+      fi
+      if [[ "$line" =~ \|\ *来源:\ *([^|]*) ]]; then
+        _src_ip="${BASH_REMATCH[1]}"
+        _src_ip="${_src_ip% }"
+      fi
       continue
     elif [[ "$line" =~ ^[[:space:]]*# ]]; then
       _comment=""
+      _src_ip=""
       continue
     fi
     if [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
-      NFT_RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}|${_comment}")
+      NFT_RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}|${_comment}|${_src_ip}")
       _comment=""
+      _src_ip=""
     fi
   done < "$NFT_CONF_FILE"
 }
@@ -1347,14 +1376,12 @@ table ip ${NFT_TABLE_NAME} {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
 EOF
-  local rule lport dip dport comment comment_suffix
+  local rule lport dip dport comment src_ip comment_suffix
   for rule in "${NFT_RULES[@]}"; do
-    IFS='|' read -r lport dip dport comment <<< "$rule"
-    if [[ -n "$comment" ]]; then
-      comment_suffix=" | 备注: ${comment}"
-    else
-      comment_suffix=""
-    fi
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    comment_suffix=""
+    [[ -n "$comment" ]] && comment_suffix+=" | 备注: ${comment}"
+    [[ -n "$src_ip" ]] && comment_suffix+=" | 来源: ${src_ip}"
     cat >> "$tmp_file" <<EOF
 
         # 转发: 本机:${lport} -> ${dip}:${dport}${comment_suffix}
@@ -1370,12 +1397,10 @@ EOF
         type nat hook postrouting priority 100; policy accept;
 EOF
   for rule in "${NFT_RULES[@]}"; do
-    IFS='|' read -r lport dip dport comment <<< "$rule"
-    if [[ -n "$comment" ]]; then
-      comment_suffix=" | 备注: ${comment}"
-    else
-      comment_suffix=""
-    fi
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    comment_suffix=""
+    [[ -n "$comment" ]] && comment_suffix+=" | 备注: ${comment}"
+    [[ -n "$src_ip" ]] && comment_suffix+=" | 来源: ${src_ip}"
     cat >> "$tmp_file" <<EOF
 
         # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为本机 IP${comment_suffix}
@@ -1558,12 +1583,12 @@ _nft_do_list() {
     echo -e "${C_GREEN}[信息]${C_RESET} 当前没有端口转发规则。"
     return
   fi
-  printf "\n\033[1m%-6s %-10s %-10s    %-22s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "备注"
-  echo "──────────────────────────────────────────────────────────────────"
-  local idx=1 rule lport dip dport comment
+  printf "\n\033[1m%-6s %-10s %-10s    %-22s  %-18s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "来源限制" "备注"
+  echo "──────────────────────────────────────────────────────────────────────────────────────"
+  local idx=1 rule lport dip dport comment src_ip
   for rule in "${NFT_RULES[@]}"; do
-    IFS='|' read -r lport dip dport comment <<< "$rule"
-    printf "%-6s %-10s %-10s -> %-22s  %s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "$comment"
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    printf "%-6s %-10s %-10s -> %-22s  %-18s  %s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "${src_ip:-any}" "$comment"
     ((idx++))
   done
   echo ""
@@ -1630,20 +1655,35 @@ _nft_do_add() {
   read -rp "请输入备注（可选，直接回车跳过）: " comment
   # 备注中不允许包含管道符，避免破坏分隔格式
   comment="${comment//|/}"
+  # 当 UFW 处于活跃状态时，询问是否限制来源 IP
+  local src_ip=""
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+    echo ""
+    echo "检测到 UFW 防火墙处于活跃状态。"
+    echo "来源 IP 限制（留空表示允许所有来源）："
+    echo "  支持单个 IP (如 1.2.3.4) 或 CIDR 网段 (如 10.0.0.0/8)"
+    read -rp "请输入来源 IP [默认 any]: " src_ip
+    src_ip="${src_ip// /}"
+    if [[ -n "$src_ip" ]] && ! _validate_ip_or_cidr "$src_ip"; then
+      echo -e "${C_RED}[错误]${C_RESET} IP 地址/网段格式无效，将不限制来源。"
+      src_ip=""
+    fi
+  fi
   echo ""
   echo "即将添加转发规则:"
   echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
   [[ -n "$comment" ]] && echo "  备注: ${comment}"
+  [[ -n "$src_ip" ]] && echo "  UFW 来源限制: ${src_ip}"
   read -rp "确认添加？[Y/n]: " confirm
   if [[ "$confirm" =~ ^[Nn]$ ]]; then
     echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
     return
   fi
-  NFT_RULES+=("${lport}|${dip}|${dport}|${comment}")
+  NFT_RULES+=("${lport}|${dip}|${dport}|${comment}|${src_ip}")
   if ! _nft_save_and_reload; then return; fi
-  _nft_firewall_port open "$lport" "$dip" "$dport"
+  _nft_firewall_port open "$lport" "$dip" "$dport" "$src_ip"
   echo -e "${C_GREEN}[信息]${C_RESET} 转发规则添加成功: ${lport} → ${dip}:${dport}"
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 新增转发: ${lport} -> ${dip}:${dport}${comment:+ (${comment})}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 新增转发: ${lport} -> ${dip}:${dport}${comment:+ (${comment})}${src_ip:+ [来源: ${src_ip}]}" >> "$NFT_LOG_FILE" 2>/dev/null || true
   echo -e "${C_GREEN}[信息]${C_RESET} 若转发不通，请使用菜单中的【诊断/自检】排查。"
 }
 
@@ -1658,12 +1698,12 @@ _nft_do_delete() {
     echo -e "${C_GREEN}[信息]${C_RESET} 当前没有端口转发规则，无需删除。"
     return
   fi
-  printf "\n\033[1m%-6s %-10s %-10s    %-22s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "备注"
-  echo "──────────────────────────────────────────────────────────────────"
-  local idx=1 rule lport dip dport comment
+  printf "\n\033[1m%-6s %-10s %-10s    %-22s  %-18s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "来源限制" "备注"
+  echo "──────────────────────────────────────────────────────────────────────────────────────"
+  local idx=1 rule lport dip dport comment src_ip
   for rule in "${NFT_RULES[@]}"; do
-    IFS='|' read -r lport dip dport comment <<< "$rule"
-    printf "%-6s %-10s %-10s -> %-22s  %s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "$comment"
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    printf "%-6s %-10s %-10s -> %-22s  %-18s  %s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "${src_ip:-any}" "$comment"
     ((idx++))
   done
   echo ""
@@ -1678,10 +1718,11 @@ _nft_do_delete() {
     return
   fi
   local target="${NFT_RULES[$((choice-1))]}"
-  IFS='|' read -r lport dip dport comment <<< "$target"
+  IFS='|' read -r lport dip dport comment src_ip <<< "$target"
   echo "即将删除转发规则:"
   echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
   [[ -n "$comment" ]] && echo "  备注: ${comment}"
+  [[ -n "$src_ip" ]] && echo "  来源限制: ${src_ip}"
   read -rp "确认删除？[Y/n]: " confirm
   if [[ "$confirm" =~ ^[Nn]$ ]]; then
     echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
@@ -1690,9 +1731,9 @@ _nft_do_delete() {
   unset 'NFT_RULES[$((choice-1))]'
   NFT_RULES=("${NFT_RULES[@]}")
   if ! _nft_save_and_reload; then return; fi
-  _nft_firewall_port close "$lport" "$dip" "$dport"
+  _nft_firewall_port close "$lport" "$dip" "$dport" "$src_ip"
   echo -e "${C_GREEN}[信息]${C_RESET} 转发规则已删除: ${lport} → ${dip}:${dport}"
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除转发: ${lport} -> ${dip}:${dport}${comment:+ (${comment})}" >> "$NFT_LOG_FILE" 2>/dev/null || true
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除转发: ${lport} -> ${dip}:${dport}${comment:+ (${comment})}${src_ip:+ [来源: ${src_ip}]}" >> "$NFT_LOG_FILE" 2>/dev/null || true
 }
 
 _nft_do_clear_all() {
@@ -1712,10 +1753,10 @@ _nft_do_clear_all() {
     echo -e "${C_GREEN}[信息]${C_RESET} 已取消。"
     return
   fi
-  local rule lport dip dport comment
+  local rule lport dip dport comment src_ip
   for rule in "${NFT_RULES[@]}"; do
-    IFS='|' read -r lport dip dport comment <<< "$rule"
-    _nft_firewall_port close "$lport" "$dip" "$dport" "force"
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    _nft_firewall_port close "$lport" "$dip" "$dport" "$src_ip" "force"
   done
   NFT_RULES=()
   if ! _nft_save_and_reload; then return; fi
@@ -1734,12 +1775,12 @@ _nft_do_edit_comment() {
     echo -e "${C_GREEN}[信息]${C_RESET} 当前没有端口转发规则。"
     return
   fi
-  printf "\n\033[1m%-6s %-10s %-10s    %-22s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "备注"
-  echo "──────────────────────────────────────────────────────────────────"
-  local idx=1 rule lport dip dport comment
+  printf "\n\033[1m%-6s %-10s %-10s    %-22s  %-18s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "来源限制" "备注"
+  echo "──────────────────────────────────────────────────────────────────────────────────────"
+  local idx=1 rule lport dip dport comment src_ip
   for rule in "${NFT_RULES[@]}"; do
-    IFS='|' read -r lport dip dport comment <<< "$rule"
-    printf "%-6s %-10s %-10s -> %-22s  %s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "$comment"
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    printf "%-6s %-10s %-10s -> %-22s  %-18s  %s\n" "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "${src_ip:-any}" "$comment"
     ((idx++))
   done
   echo ""
@@ -1754,7 +1795,7 @@ _nft_do_edit_comment() {
     return
   fi
   local target="${NFT_RULES[$((choice-1))]}"
-  IFS='|' read -r lport dip dport comment <<< "$target"
+  IFS='|' read -r lport dip dport comment src_ip <<< "$target"
   if [[ -n "$comment" ]]; then
     echo "当前备注: ${comment}"
   else
@@ -1763,7 +1804,7 @@ _nft_do_edit_comment() {
   local new_comment
   read -rp "请输入新备注（留空则清除备注）: " new_comment
   new_comment="${new_comment//|/}"
-  NFT_RULES[$((choice-1))]="${lport}|${dip}|${dport}|${new_comment}"
+  NFT_RULES[$((choice-1))]="${lport}|${dip}|${dport}|${new_comment}|${src_ip}"
   if ! _nft_save_and_reload; then return; fi
   if [[ -n "$new_comment" ]]; then
     echo -e "${C_GREEN}[信息]${C_RESET} 备注已更新: ${lport} → ${dip}:${dport} (${new_comment})"
@@ -1874,9 +1915,9 @@ _nft_do_diagnose() {
   if [[ ${#NFT_RULES[@]} -gt 0 ]]; then
     read -rp "是否测试目标连通性？[y/N]: " test_conn
     if [[ "$test_conn" =~ ^[Yy]$ ]]; then
-      local rule lport dip dport comment
+      local rule lport dip dport comment src_ip
       for rule in "${NFT_RULES[@]}"; do
-        IFS='|' read -r lport dip dport comment <<< "$rule"
+        IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
         printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
         if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
           printf "${C_GREEN}通${C_RESET}\n"
