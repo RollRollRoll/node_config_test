@@ -1810,6 +1810,145 @@ _nft_do_edit_comment() {
   fi
 }
 
+# ============================================================
+#  UFW 与 nftables 转发规则同步检查
+# ============================================================
+_nft_ufw_delete_related() {
+  local lport="$1" dip="$2" dport="$3"
+  local esc_dip="${dip//./\\.}"
+  local numbered
+  numbered=$(ufw status numbered 2>/dev/null) || return
+
+  local -a del_nums=()
+  local line num
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\[\ *([0-9]+)\] ]] || continue
+    num="${BASH_REMATCH[1]}"
+    # IN 规则: 匹配本机端口 (如 12340, 12340/tcp, 12340/udp)
+    if echo "$line" | grep -qE "^\[.*\][[:space:]]+${lport}(/[a-z]+)?[[:space:]]+ALLOW IN"; then
+      del_nums+=("$num")
+    # FWD 规则: 匹配目标地址 (如 23.249.27.138 1234/tcp)
+    elif echo "$line" | grep -qE "^\[.*\][[:space:]]+${esc_dip} ${dport}/(tcp|udp)[[:space:]]+ALLOW FWD"; then
+      del_nums+=("$num")
+    fi
+  done <<< "$numbered"
+
+  # 从大到小删除，避免编号偏移
+  local i
+  for (( i=${#del_nums[@]}-1; i>=0; i-- )); do
+    yes | ufw delete "${del_nums[$i]}" >/dev/null 2>&1 || true
+  done
+}
+
+_nft_check_ufw_sync() {
+  # 仅在 UFW 激活时检查
+  if ! command -v ufw &>/dev/null || ! ufw status 2>/dev/null | grep -qw "active"; then
+    return
+  fi
+  [[ ${#NFT_RULES[@]} -eq 0 ]] && return
+
+  echo ""
+  echo "--- UFW 规则同步检查 ---"
+
+  # 获取 UFW 规则（排除 v6 和表头）
+  local ufw_rules
+  ufw_rules=$(ufw status 2>/dev/null | tail -n +5 | grep -v '(v6)' || true)
+
+  local rule lport dip dport comment src_ip
+  local has_mismatch=false
+  local -a fix_rules=()
+
+  for rule in "${NFT_RULES[@]}"; do
+    IFS='|' read -r lport dip dport comment src_ip <<< "$rule"
+    local issues=""
+    local esc_dip="${dip//./\\.}"
+
+    if [[ -n "$src_ip" ]]; then
+      local esc_src="${src_ip//./\\.}"
+      # 期望: 有来源限制的 IN 规则
+      if ! echo "$ufw_rules" | grep -qE "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN.*${esc_src}"; then
+        issues+="缺少IN规则(需要来源${src_ip}); "
+      fi
+      # 检查是否存在不应有的无限制 IN 规则
+      if echo "$ufw_rules" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN" | grep -q "Anywhere"; then
+        issues+="存在多余的无限制IN规则; "
+      fi
+      # 期望: 有来源限制的 FWD 规则
+      if ! echo "$ufw_rules" | grep -qE "${esc_dip} ${dport}/(tcp|udp)[[:space:]]+ALLOW FWD.*${esc_src}"; then
+        issues+="缺少FWD规则(需要来源${src_ip}); "
+      fi
+    else
+      # 期望: 无限制的 IN 规则
+      if ! echo "$ufw_rules" | grep -qE "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN.*Anywhere"; then
+        issues+="缺少IN规则; "
+      fi
+      # 检查是否存在不应有的来源限制 IN 规则
+      if echo "$ufw_rules" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN" | grep -qv "Anywhere"; then
+        issues+="存在多余的来源限制IN规则; "
+      fi
+      # 期望: 无限制的 FWD 规则
+      if ! echo "$ufw_rules" | grep -qE "${esc_dip} ${dport}/(tcp|udp)[[:space:]]+ALLOW FWD.*Anywhere"; then
+        issues+="缺少FWD规则; "
+      fi
+    fi
+
+    if [[ -n "$issues" ]]; then
+      has_mismatch=true
+      echo -e "  ${C_YELLOW}[不匹配]${C_RESET} ${lport} → ${dip}:${dport} (nftables来源: ${src_ip:-any})"
+      echo "           ${issues}"
+      fix_rules+=("$rule")
+    else
+      echo -e "  ${C_GREEN}[匹配]${C_RESET} ${lport} → ${dip}:${dport} (来源: ${src_ip:-any})"
+    fi
+  done
+
+  if $has_mismatch; then
+    echo ""
+    read -rp "是否自动修复不匹配的 UFW 规则？[y/N]: " fix_ans
+    if [[ "$fix_ans" =~ ^[Yy]$ ]]; then
+      # 收集需要重建 FWD 规则的目标（删除后需从所有 nftables 规则重建）
+      local -A fix_dests=()
+      local r
+      for r in "${fix_rules[@]}"; do
+        IFS='|' read -r lport dip dport comment src_ip <<< "$r"
+        echo -e "  修复: ${lport} → ${dip}:${dport} (来源: ${src_ip:-any}) ..."
+        fix_dests["${dip}|${dport}"]=1
+        # 删除该端口和目标的所有 UFW 规则
+        _nft_ufw_delete_related "$lport" "$dip" "$dport"
+        # 添加正确的 IN 规则
+        if [[ -n "$src_ip" ]]; then
+          ufw allow from "$src_ip" to any port "${lport}" proto tcp >/dev/null 2>&1 || true
+          ufw allow from "$src_ip" to any port "${lport}" proto udp >/dev/null 2>&1 || true
+        else
+          ufw allow "${lport}/tcp" >/dev/null 2>&1 || true
+          ufw allow "${lport}/udp" >/dev/null 2>&1 || true
+        fi
+      done
+      # 重建受影响目标的 FWD 规则（从所有 nftables 规则中，避免遗漏共享目标的规则）
+      local dest _lp _di _dp _c _si
+      for dest in "${!fix_dests[@]}"; do
+        IFS='|' read -r _di _dp <<< "$dest"
+        for r in "${NFT_RULES[@]}"; do
+          IFS='|' read -r _lp _di2 _dp2 _c _si <<< "$r"
+          if [[ "$_di2" == "$_di" && "$_dp2" == "$_dp" ]]; then
+            if [[ -n "$_si" ]]; then
+              ufw route allow proto tcp from "$_si" to "${_di}" port "${_dp}" >/dev/null 2>&1 || true
+              ufw route allow proto udp from "$_si" to "${_di}" port "${_dp}" >/dev/null 2>&1 || true
+            else
+              ufw route allow proto tcp to "${_di}" port "${_dp}" >/dev/null 2>&1 || true
+              ufw route allow proto udp to "${_di}" port "${_dp}" >/dev/null 2>&1 || true
+            fi
+          fi
+        done
+      done
+      echo ""
+      echo -e "${C_GREEN}[信息]${C_RESET} UFW 规则同步修复完成。"
+    fi
+  else
+    echo -e "  ${C_GREEN}[信息]${C_RESET} 所有转发规则与 UFW 配置一致"
+  fi
+}
+
 _nft_do_diagnose() {
   echo ""
   echo "========================================"
@@ -1909,7 +2048,10 @@ _nft_do_diagnose() {
   fi
   echo ""
   _nft_load_rules
+  # UFW 规则同步检查
+  _nft_check_ufw_sync
   if [[ ${#NFT_RULES[@]} -gt 0 ]]; then
+    echo ""
     read -rp "是否测试目标连通性？[y/N]: " test_conn
     if [[ "$test_conn" =~ ^[Yy]$ ]]; then
       local rule lport dip dport comment src_ip
