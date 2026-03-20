@@ -1579,7 +1579,8 @@ _nft_do_install() {
 _nft_get_ufw_src_for_port() {
   local lport="$1" ufw_rules="$2"
   local sources
-  sources=$(echo "$ufw_rules" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN" | awk '{print $NF}' | sort -u)
+  # 匹配 IN 规则（兼容 "ALLOW IN" 和 "ALLOW" 两种格式），排除 FWD 规则
+  sources=$(echo "$ufw_rules" | grep -v "ALLOW FWD" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+" | awk '{print $NF}' | sort -u)
   if [[ -z "$sources" ]]; then
     echo "-"
   else
@@ -1599,7 +1600,7 @@ _nft_do_list() {
   local ufw_active=false ufw_rules=""
   if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
     ufw_active=true
-    ufw_rules=$(ufw status 2>/dev/null | tail -n +5 | grep -v '(v6)' || true)
+    ufw_rules=$(ufw status 2>/dev/null | grep "ALLOW" | grep -v '(v6)' || true)
   fi
   printf "\n\033[1m%-8s %-12s %-14s    %-26s  %-22s  %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "来源限制" "备注"
   echo "──────────────────────────────────────────────────────────────────────────────────────"
@@ -1849,7 +1850,7 @@ _nft_ufw_delete_related() {
     [[ "$line" =~ ^\[\ *([0-9]+)\] ]] || continue
     num="${BASH_REMATCH[1]}"
     # IN 规则: 匹配本机端口 (如 12340, 12340/tcp, 12340/udp)
-    if echo "$line" | grep -qE "^\[.*\][[:space:]]+${lport}(/[a-z]+)?[[:space:]]+ALLOW IN"; then
+    if echo "$line" | grep -v "ALLOW FWD" | grep -qE "^\[.*\][[:space:]]+${lport}(/[a-z]+)?[[:space:]]+ALLOW"; then
       del_nums+=("$num")
     # FWD 规则: 匹配目标地址 (如 23.249.27.138 1234/tcp)
     elif echo "$line" | grep -qE "^\[.*\][[:space:]]+${esc_dip} ${dport}/(tcp|udp)[[:space:]]+ALLOW FWD"; then
@@ -1876,7 +1877,7 @@ _nft_check_ufw_sync() {
 
   # 获取 UFW 规则（排除 v6 和表头）
   local ufw_rules
-  ufw_rules=$(ufw status 2>/dev/null | tail -n +5 | grep -v '(v6)' || true)
+  ufw_rules=$(ufw status 2>/dev/null | grep "ALLOW" | grep -v '(v6)' || true)
 
   local rule lport dip dport comment src_ip
   local has_mismatch=false
@@ -1887,14 +1888,18 @@ _nft_check_ufw_sync() {
     local issues=""
     local esc_dip="${dip//./\\.}"
 
+    # 提取该端口的 IN 规则（排除 FWD）
+    local port_in_rules
+    port_in_rules=$(echo "$ufw_rules" | grep -v "ALLOW FWD" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+" || true)
+
     if [[ -n "$src_ip" ]]; then
       local esc_src="${src_ip//./\\.}"
       # 期望: 有来源限制的 IN 规则
-      if ! echo "$ufw_rules" | grep -qE "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN.*${esc_src}"; then
+      if ! echo "$port_in_rules" | grep -qE "${esc_src}"; then
         issues+="缺少IN规则(需要来源${src_ip}); "
       fi
       # 检查是否存在不应有的无限制 IN 规则
-      if echo "$ufw_rules" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN" | grep -q "Anywhere"; then
+      if echo "$port_in_rules" | grep -q "Anywhere"; then
         issues+="存在多余的无限制IN规则; "
       fi
       # 期望: 有来源限制的 FWD 规则
@@ -1903,11 +1908,11 @@ _nft_check_ufw_sync() {
       fi
     else
       # 期望: 无限制的 IN 规则
-      if ! echo "$ufw_rules" | grep -qE "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN.*Anywhere"; then
+      if ! echo "$port_in_rules" | grep -q "Anywhere"; then
         issues+="缺少IN规则; "
       fi
       # 检查是否存在不应有的来源限制 IN 规则
-      if echo "$ufw_rules" | grep -E "^${lport}(/[a-z]+)?[[:space:]]+ALLOW IN" | grep -qv "Anywhere"; then
+      if echo "$port_in_rules" | grep -qv "Anywhere" | grep -q .; then
         issues+="存在多余的来源限制IN规则; "
       fi
       # 期望: 无限制的 FWD 规则
