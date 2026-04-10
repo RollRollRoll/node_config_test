@@ -83,6 +83,89 @@ print_box() {
   echo ""
 }
 
+_fail2ban_detect_package_manager() {
+  if command -v apt-get &>/dev/null; then
+    echo "apt"
+  elif command -v dnf &>/dev/null; then
+    echo "dnf"
+  elif command -v yum &>/dev/null; then
+    echo "yum"
+  else
+    echo "unknown"
+  fi
+}
+
+_fail2ban_should_enable() {
+  local answer="${1:-}"
+  answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+  [[ -z "$answer" || "$answer" == "y" || "$answer" == "yes" ]]
+}
+
+_fail2ban_render_sshd_jail() {
+  local ssh_port="${1:-22}"
+  cat <<EOF
+[sshd]
+enabled = true
+port = ${ssh_port}
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+}
+
+_setup_fail2ban_for_ssh() {
+  local ssh_port="${1:-22}"
+  local pkg_mgr
+  local jail_dir="/etc/fail2ban/jail.d"
+  local jail_file="${jail_dir}/ssh-hardening.local"
+
+  pkg_mgr="$(_fail2ban_detect_package_manager)"
+
+  case "$pkg_mgr" in
+    apt)
+      if ! apt-get update -qq >/dev/null 2>&1 || ! apt-get install -y -qq fail2ban >/dev/null 2>&1; then
+        echo -e "      ${C_YELLOW}⚠ fail2ban 安装失败，请手动检查${C_RESET}\n"
+        return 0
+      fi
+      ;;
+    dnf)
+      if ! dnf install -y fail2ban >/dev/null 2>&1; then
+        echo -e "      ${C_YELLOW}⚠ fail2ban 安装失败，请手动检查${C_RESET}\n"
+        return 0
+      fi
+      ;;
+    yum)
+      if ! yum install -y fail2ban >/dev/null 2>&1; then
+        echo -e "      ${C_YELLOW}⚠ fail2ban 安装失败，请手动检查${C_RESET}\n"
+        return 0
+      fi
+      ;;
+    *)
+      echo -e "      ${C_YELLOW}⚠ 无法识别包管理器，请手动安装 fail2ban${C_RESET}\n"
+      return 0
+      ;;
+  esac
+
+  if ! command -v fail2ban-client &>/dev/null && ! command -v fail2ban-server &>/dev/null; then
+    echo -e "      ${C_YELLOW}⚠ 未检测到 fail2ban 命令，请手动检查${C_RESET}\n"
+    return 0
+  fi
+
+  mkdir -p "$jail_dir"
+  if ! _fail2ban_render_sshd_jail "$ssh_port" > "$jail_file"; then
+    echo -e "      ${C_YELLOW}⚠ fail2ban 配置写入失败，请手动检查 ${jail_file}${C_RESET}\n"
+    return 0
+  fi
+
+  if systemctl enable fail2ban >/dev/null 2>&1 && systemctl restart fail2ban >/dev/null 2>&1; then
+    echo -e "      ${C_GREEN}✓ fail2ban 已启用，正在保护 SSH 端口 ${ssh_port}${C_RESET}"
+    echo -e "      ${C_GRAY}  查看状态: fail2ban-client status sshd${C_RESET}\n"
+  else
+    echo -e "      ${C_YELLOW}⚠ fail2ban 已安装并写入配置，但服务启用失败${C_RESET}"
+    echo -e "      ${C_GRAY}  请手动执行: systemctl enable fail2ban && systemctl restart fail2ban${C_RESET}\n"
+  fi
+}
+
 # 写入结果键值对到 results.dat
 write_result() {
   echo "$1=$2" >> "$RESULTS_FILE"
@@ -521,8 +604,8 @@ upload_test() {
 do_ssh_harden() {
   echo -e "\n${C_BOLD_WHITE}━━━━━━━━━━ SSH 安全加固 ━━━━━━━━━━${C_RESET}\n"
 
-  # --- [1/6] 获取新端口 ---
-  echo -e "${C_CYAN}[1/6] 设置 SSH 端口${C_RESET}"
+  # --- [1/7] 获取新端口 ---
+  echo -e "${C_CYAN}[1/7] 设置 SSH 端口${C_RESET}"
   local new_port
   read -rp "      请输入新的 SSH 端口 [默认 2222]: " new_port
   new_port="${new_port:-2222}"
@@ -533,8 +616,8 @@ do_ssh_harden() {
   fi
   echo -e "      ${C_GREEN}✓ 端口设置为 ${new_port}${C_RESET}\n"
 
-  # --- [2/6] 获取公钥并写入 ---
-  echo -e "${C_CYAN}[2/6] 配置 SSH 公钥${C_RESET}"
+  # --- [2/7] 获取公钥并写入 ---
+  echo -e "${C_CYAN}[2/7] 配置 SSH 公钥${C_RESET}"
   echo "      请粘贴你的 SSH 公钥（以 ssh-rsa / ssh-ed25519 / ecdsa-sha2 开头）："
   local pubkey
   read -r pubkey
@@ -556,8 +639,8 @@ do_ssh_harden() {
     echo -e "      ${C_GREEN}✓ 公钥已写入 ${ssh_dir}/authorized_keys${C_RESET}\n"
   fi
 
-  # --- [3/6] 备份并修改 sshd_config ---
-  echo -e "${C_CYAN}[3/6] 修改 SSH 配置${C_RESET}"
+  # --- [3/7] 备份并修改 sshd_config ---
+  echo -e "${C_CYAN}[3/7] 修改 SSH 配置${C_RESET}"
   local sshd_config="/etc/ssh/sshd_config"
   local backup="${sshd_config}.bak.$(date +%Y%m%d%H%M%S)"
   cp "$sshd_config" "$backup"
@@ -601,8 +684,8 @@ do_ssh_harden() {
 
   echo -e "      ${C_GREEN}✓ Port=${new_port}, 密钥登录, 禁用密码${C_RESET}\n"
 
-  # --- [4/6] Ubuntu ssh.socket ---
-  echo -e "${C_CYAN}[4/6] 检查 Ubuntu ssh.socket${C_RESET}"
+  # --- [4/7] Ubuntu ssh.socket ---
+  echo -e "${C_CYAN}[4/7] 检查 Ubuntu ssh.socket${C_RESET}"
   local socket_file="/lib/systemd/system/ssh.socket"
   if [[ -f "$socket_file" ]]; then
     local socket_backup="${socket_file}.bak.$(date +%Y%m%d%H%M%S)"
@@ -614,8 +697,8 @@ do_ssh_harden() {
     echo -e "      ${C_GRAY}─ 未检测到 ssh.socket，跳过${C_RESET}\n"
   fi
 
-  # --- [5/6] 配置 ufw ---
-  echo -e "${C_CYAN}[5/6] 配置防火墙${C_RESET}"
+  # --- [5/7] 配置 ufw ---
+  echo -e "${C_CYAN}[5/7] 配置防火墙${C_RESET}"
   if command -v ufw &>/dev/null; then
     ufw allow "${new_port}/tcp"
     ufw --force enable
@@ -624,8 +707,8 @@ do_ssh_harden() {
     echo -e "      ${C_YELLOW}⚠ 未检测到 ufw，请手动配置防火墙放行端口 ${new_port}${C_RESET}\n"
   fi
 
-  # --- [6/6] 重启 SSH 服务 ---
-  echo -e "${C_CYAN}[6/6] 重启 SSH 服务${C_RESET}"
+  # --- [6/7] 重启 SSH 服务 ---
+  echo -e "${C_CYAN}[6/7] 重启 SSH 服务${C_RESET}"
   if systemctl is-active --quiet sshd 2>/dev/null; then
     systemctl restart sshd
     echo -e "      ${C_GREEN}✓ sshd 已重启${C_RESET}"
@@ -635,6 +718,17 @@ do_ssh_harden() {
   else
     echo -e "      ${C_YELLOW}⚠ 无法确定 SSH 服务名，请手动重启${C_RESET}"
   fi
+  echo ""
+
+  # --- [7/7] 配置 fail2ban ---
+  echo -e "${C_CYAN}[7/7] 配置 fail2ban${C_RESET}"
+  local enable_fail2ban
+  read -rp "      是否安装并启用 fail2ban 防暴力破解？[Y/n]: " enable_fail2ban
+  if _fail2ban_should_enable "$enable_fail2ban"; then
+    _setup_fail2ban_for_ssh "$new_port"
+  else
+    echo -e "      ${C_GRAY}─ 已跳过 fail2ban${C_RESET}\n"
+  fi
 
   # --- 完成提示框 ---
   print_box \
@@ -643,7 +737,8 @@ do_ssh_harden() {
     "请用新端口 ${new_port} 新开一个终端测试 SSH 连接" \
     "确认能正常登录后，再关闭当前会话！" \
     "" \
-    "ssh -p ${new_port} root@<服务器IP>"
+    "ssh -p ${new_port} root@<服务器IP>" \
+    "如需查看 fail2ban 状态，可执行: fail2ban-client status sshd"
 }
 
 # ============================================================
