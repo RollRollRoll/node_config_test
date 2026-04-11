@@ -2786,6 +2786,23 @@ _ssh_cfg_write_block() {
   } >> "$config_file"
 }
 
+# 从 config 文件中删除指定 Host 块（操作前自动备份）
+# 参数：config_file host
+_ssh_cfg_remove_host() {
+  local config_file="$1"
+  local host="$2"
+  [[ -f "$config_file" ]] || return 0
+
+  local backup="${config_file}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$config_file" "$backup"
+
+  awk -v h="$host" '
+    /^Host[[:space:]]/ && $2 == h { skip=1; next }
+    /^Host[[:space:]]/             { skip=0 }
+    !skip                          { print }
+  ' "$backup" > "$config_file"
+}
+
 # ============================================================
 #  主菜单
 # ============================================================

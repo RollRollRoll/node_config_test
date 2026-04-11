@@ -96,3 +96,38 @@ out2="$(cat "$tmpconf2")"
 assert_contains "ProxyCommand nc -X 5 -x 127.0.0.1:6153 %h %p" "$out2" "write_block ProxyCommand"
 
 printf 'ssh_cfg_write_block checks passed\n'
+
+# ── _ssh_cfg_remove_host 测试 ────────────────────────────────
+tmpconf3="${TMPDIR_TEST}/config3"
+
+cat > "$tmpconf3" <<'EOF'
+Host vps-a
+    HostName 1.1.1.1
+    User root
+    Port 22
+    IdentitiesOnly yes
+    IdentityFile ~/.ssh/vps-a
+
+Host vps-b
+    HostName 2.2.2.2
+    User root
+    Port 2222
+    IdentitiesOnly yes
+    IdentityFile ~/.ssh/vps-b
+EOF
+
+_ssh_cfg_remove_host "$tmpconf3" "vps-a"
+
+# vps-a 已删除
+assert_fail _ssh_cfg_host_exists "$tmpconf3" "vps-a"
+# vps-b 仍存在
+assert_ok   _ssh_cfg_host_exists "$tmpconf3" "vps-b"
+# 备份文件存在
+ls "${tmpconf3}.bak."* >/dev/null 2>&1 || { printf 'FAIL: backup not found\n' >&2; exit 1; }
+printf 'PASS: backup file created\n'
+
+# 删除不存在的 host 不报错
+_ssh_cfg_remove_host "$tmpconf3" "nonexistent"
+printf 'PASS: remove nonexistent host is no-op\n'
+
+printf 'ssh_cfg_remove_host checks passed\n'
