@@ -3073,6 +3073,47 @@ do_ssh_config() {
 # ============================================================
 #  13) 安装 Mosh 和 tmux
 # ============================================================
+
+# 放行 Mosh UDP 60000-61000 端口（自动识别 ufw / nftables / firewalld）
+_mosh_open_firewall_ports() {
+  local MOSH_PORTS="60000:61000"   # ufw/nftables 范围格式
+  local MOSH_FWD_PORTS="60000-61000"  # firewalld 范围格式
+  echo ""
+  echo -e "${C_CYAN}正在为 Mosh 放行 UDP ${MOSH_FWD_PORTS} 端口...${C_RESET}"
+
+  # --- ufw ---
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${MOSH_PORTS}/udp" >/dev/null 2>&1
+    echo -e "   ${C_GREEN}✔ ufw：已放行 ${MOSH_PORTS}/udp${C_RESET}"
+    return 0
+  fi
+
+  # --- nftables ---
+  if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "type filter"; then
+    # 找到 input hook 的表+链名，追加 udp dport 放行规则
+    local nft_table nft_chain
+    nft_table=$(nft list ruleset 2>/dev/null | awk '/table/{t=$3} /hook input/{print t; exit}')
+    nft_chain=$(nft list ruleset 2>/dev/null | awk '/chain/{c=$2} /hook input/{print c; exit}')
+    if [[ -n "$nft_table" && -n "$nft_chain" ]]; then
+      nft add rule inet "$nft_table" "$nft_chain" udp dport 60000-61000 accept 2>/dev/null
+      echo -e "   ${C_GREEN}✔ nftables：已在 ${nft_table}/${nft_chain} 放行 udp dport 60000-61000${C_RESET}"
+      return 0
+    fi
+  fi
+
+  # --- firewalld ---
+  if command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q "running"; then
+    firewall-cmd --permanent --add-port="${MOSH_FWD_PORTS}/udp" >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1
+    echo -e "   ${C_GREEN}✔ firewalld：已放行 ${MOSH_FWD_PORTS}/udp（permanent）${C_RESET}"
+    return 0
+  fi
+
+  # --- 未检测到活跃防火墙 ---
+  echo -e "   ${C_YELLOW}⚠ 未检测到活跃的防火墙（ufw/nftables/firewalld），跳过自动放行${C_RESET}"
+  echo -e "   ${C_YELLOW}  如有需要请手动放行 UDP 60000-61000${C_RESET}"
+}
+
 do_mosh_tmux_install() {
   echo -e "${C_CYAN}=== 安装 Mosh 和 tmux ===${C_RESET}"
   echo ""
@@ -3099,6 +3140,8 @@ do_mosh_tmux_install() {
   esac
   if command -v mosh &>/dev/null; then
     echo -e "${C_GREEN}✔ Mosh 安装成功：$(mosh --version 2>&1 | head -1)${C_RESET}"
+    # 安装成功后自动放行 Mosh 所需的 UDP 端口范围
+    _mosh_open_firewall_ports
   else
     echo -e "${C_RED}✘ Mosh 安装失败，请检查包源或手动安装${C_RESET}"
   fi
@@ -3119,7 +3162,6 @@ do_mosh_tmux_install() {
   fi
 
   echo ""
-  echo -e "${C_CYAN}提示：Mosh 使用 UDP 60000-61000 端口，如启用了防火墙请放行该范围${C_RESET}"
   echo -e "${C_CYAN}      mosh user@host        # 连接远程服务器${C_RESET}"
   echo -e "${C_CYAN}      tmux new -s main      # 创建新会话${C_RESET}"
 }
