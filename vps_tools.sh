@@ -90,9 +90,71 @@ _fail2ban_detect_package_manager() {
     echo "dnf"
   elif command -v yum &>/dev/null; then
     echo "yum"
+  elif command -v apk &>/dev/null; then
+    echo "apk"
   else
     echo "unknown"
   fi
+}
+
+_detect_init_system() {
+  if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
+    echo "systemd"
+  elif command -v rc-service &>/dev/null; then
+    echo "openrc"
+  else
+    echo "unknown"
+  fi
+}
+
+_svc_enable() {
+  local svc="$1"
+  case "$(_detect_init_system)" in
+    systemd) systemctl enable "$svc" >/dev/null 2>&1 ;;
+    openrc)  rc-update add "$svc" default >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+_svc_start() {
+  local svc="$1"
+  case "$(_detect_init_system)" in
+    systemd) systemctl start "$svc" >/dev/null 2>&1 ;;
+    openrc)  rc-service "$svc" start >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+_svc_restart() {
+  local svc="$1"
+  case "$(_detect_init_system)" in
+    systemd) systemctl restart "$svc" >/dev/null 2>&1 ;;
+    openrc)  rc-service "$svc" restart >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+_svc_enable_now() {
+  local svc="$1"
+  _svc_enable "$svc" && _svc_start "$svc"
+}
+
+_svc_is_active() {
+  local svc="$1"
+  case "$(_detect_init_system)" in
+    systemd) systemctl is-active --quiet "$svc" 2>/dev/null ;;
+    openrc)  rc-service "$svc" status >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+_svc_is_enabled() {
+  local svc="$1"
+  case "$(_detect_init_system)" in
+    systemd) systemctl is-enabled "$svc" 2>/dev/null | grep -qw enabled ;;
+    openrc)  rc-update show default 2>/dev/null | grep -qw "$svc" ;;
+    *)       return 1 ;;
+  esac
 }
 
 _fail2ban_should_enable() {
@@ -140,6 +202,12 @@ _setup_fail2ban_for_ssh() {
         return 0
       fi
       ;;
+    apk)
+      if ! apk add --no-cache fail2ban >/dev/null 2>&1; then
+        echo -e "      ${C_YELLOW}⚠ fail2ban 安装失败，请手动检查（需启用 community 仓库）${C_RESET}\n"
+        return 0
+      fi
+      ;;
     *)
       echo -e "      ${C_YELLOW}⚠ 无法识别包管理器，请手动安装 fail2ban${C_RESET}\n"
       return 0
@@ -157,12 +225,12 @@ _setup_fail2ban_for_ssh() {
     return 0
   fi
 
-  if systemctl enable fail2ban >/dev/null 2>&1 && systemctl restart fail2ban >/dev/null 2>&1; then
+  if _svc_enable "fail2ban" && _svc_restart "fail2ban"; then
     echo -e "      ${C_GREEN}✓ fail2ban 已启用，正在保护 SSH 端口 ${ssh_port}${C_RESET}"
     echo -e "      ${C_GRAY}  查看状态: fail2ban-client status sshd${C_RESET}\n"
   else
     echo -e "      ${C_YELLOW}⚠ fail2ban 已安装并写入配置，但服务启用失败${C_RESET}"
-    echo -e "      ${C_GRAY}  请手动执行: systemctl enable fail2ban && systemctl restart fail2ban${C_RESET}\n"
+    echo -e "      ${C_GRAY}  请手动启用 fail2ban 服务${C_RESET}\n"
   fi
 }
 
@@ -709,11 +777,11 @@ do_ssh_harden() {
 
   # --- [6/7] 重启 SSH 服务 ---
   echo -e "${C_CYAN}[6/7] 重启 SSH 服务${C_RESET}"
-  if systemctl is-active --quiet sshd 2>/dev/null; then
-    systemctl restart sshd
+  if _svc_is_active "sshd"; then
+    _svc_restart "sshd"
     echo -e "      ${C_GREEN}✓ sshd 已重启${C_RESET}"
-  elif systemctl is-active --quiet ssh 2>/dev/null; then
-    systemctl restart ssh
+  elif _svc_is_active "ssh"; then
+    _svc_restart "ssh"
     echo -e "      ${C_GREEN}✓ ssh 已重启${C_RESET}"
   else
     echo -e "      ${C_YELLOW}⚠ 无法确定 SSH 服务名，请手动重启${C_RESET}"
@@ -756,8 +824,11 @@ do_system_update() {
   elif command -v yum &>/dev/null; then
     echo "检测到 yum，开始更新..."
     yum update -y
+  elif command -v apk &>/dev/null; then
+    echo "检测到 apk，开始更新..."
+    apk update && apk upgrade
   else
-    echo "未检测到支持的包管理器（apt/dnf/yum）"
+    echo "未检测到支持的包管理器（apt/dnf/yum/apk）"
     return 1
   fi
 
@@ -963,9 +1034,19 @@ _ensure_ufw() {
   if command -v ufw &>/dev/null; then
     return 0
   fi
+  if command -v apk &>/dev/null; then
+    echo -e "   ${C_YELLOW}⚠ Alpine Linux 不支持 ufw，请使用 nftables 管理防火墙（菜单选项 7）${C_RESET}"
+    return 1
+  fi
   echo -ne "   安装 ufw..."
-  apt-get update -qq >/dev/null 2>&1
-  apt-get install -y -qq ufw >/dev/null 2>&1
+  if command -v apt-get &>/dev/null; then
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq ufw >/dev/null 2>&1
+  elif command -v dnf &>/dev/null; then
+    dnf install -y ufw >/dev/null 2>&1
+  elif command -v yum &>/dev/null; then
+    yum install -y ufw >/dev/null 2>&1
+  fi
   if command -v ufw &>/dev/null; then
     echo -e " ${C_GREEN}✓${C_RESET}"
     return 0
@@ -1203,6 +1284,17 @@ _fw_reset() {
 }
 
 do_firewall() {
+  if command -v apk &>/dev/null && ! command -v ufw &>/dev/null; then
+    echo -e "\n${C_YELLOW}⚠ Alpine Linux 不支持 ufw 防火墙管理${C_RESET}"
+    echo -e "${C_CYAN}建议使用菜单选项 7（端口转发/nftables）管理防火墙规则${C_RESET}"
+    echo ""
+    local jump_nft
+    read -rp "是否跳转到 nftables 管理？[Y/n]: " jump_nft
+    if [[ "${jump_nft,,}" != "n" ]]; then
+      do_nft_forward
+    fi
+    return 0
+  fi
   _ensure_ufw || return 1
 
   while true; do
@@ -1653,10 +1745,10 @@ _nft_do_install() {
       echo -e "${C_RED}[错误]${C_RESET} 加载 ${NFT_MAIN_CONF} 失败，请检查配置。"
       return 1
     fi
-    if systemctl enable --now nftables 2>/dev/null; then
+    if _svc_enable_now "nftables"; then
       echo -e "${C_GREEN}[信息]${C_RESET} 已启用 nftables 服务。"
     else
-      echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务启用失败，请手动执行: systemctl enable --now nftables"
+      echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务启用失败，请手动启用 nftables 服务"
     fi
     echo -e "${C_GREEN}[信息]${C_RESET} 初始化完成，所有配置已由本脚本接管。"
     return 0
@@ -1668,12 +1760,14 @@ _nft_do_install() {
   elif command -v dnf &>/dev/null; then pkg_mgr="dnf"
   elif command -v yum &>/dev/null; then pkg_mgr="yum"
   elif command -v pacman &>/dev/null; then pkg_mgr="pacman"
+  elif command -v apk &>/dev/null; then pkg_mgr="apk"
   fi
   case "$pkg_mgr" in
     apt) apt-get update -y && apt-get install -y nftables ;;
     dnf) dnf install -y nftables ;;
     yum) yum install -y nftables ;;
     pacman) pacman -Sy --noconfirm nftables ;;
+    apk) apk add --no-cache nftables ;;
     *) echo -e "${C_RED}[错误]${C_RESET} 无法识别包管理器，请手动安装 nftables。"; return 1 ;;
   esac
   if ! command -v nft &>/dev/null; then
@@ -1692,10 +1786,10 @@ _nft_do_install() {
     echo -e "${C_GREEN}[信息]${C_RESET} 检测到 iptables 规则集存在，添加转发规则时将自动放行对应端口。"
   fi
   _nft_init_conf
-  if systemctl enable --now nftables 2>/dev/null; then
+  if _svc_enable_now "nftables"; then
     echo -e "${C_GREEN}[信息]${C_RESET} 已启用 nftables 服务。"
   else
-    echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务启用失败，请手动执行: systemctl enable --now nftables"
+    echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务启用失败，请手动启用 nftables 服务"
   fi
   echo -e "${C_GREEN}[信息]${C_RESET} 安装与初始化完成。"
 }
@@ -2122,19 +2216,25 @@ _nft_do_diagnose() {
     echo "  → 修复: 选择菜单【安装 nftables】"
   fi
   local svc_enabled svc_active
-  svc_enabled=$(systemctl is-enabled nftables 2>/dev/null) || svc_enabled="unknown"
-  svc_active=$(systemctl is-active nftables 2>/dev/null) || svc_active="unknown"
-  if [[ "$svc_enabled" == "enabled" ]]; then
+  if _svc_is_enabled "nftables"; then
     echo -e "${C_GREEN}[信息]${C_RESET} nftables 开机启动: 是"
   else
     echo -e "${C_YELLOW}[警告]${C_RESET} nftables 开机启动: 否（重启后规则可能丢失）"
-    echo "  → 修复: systemctl enable nftables"
+    if [[ "$(_detect_init_system)" == "openrc" ]]; then
+      echo "  → 修复: rc-update add nftables default"
+    else
+      echo "  → 修复: systemctl enable nftables"
+    fi
   fi
-  if [[ "$svc_active" == "active" ]]; then
+  if _svc_is_active "nftables"; then
     echo -e "${C_GREEN}[信息]${C_RESET} nftables 服务状态: 运行中"
   else
     echo -e "${C_YELLOW}[警告]${C_RESET} nftables 服务状态: 未运行"
-    echo "  → 修复: systemctl start nftables"
+    if [[ "$(_detect_init_system)" == "openrc" ]]; then
+      echo "  → 修复: rc-service nftables start"
+    else
+      echo "  → 修复: systemctl start nftables"
+    fi
   fi
   if nft list table ip "$NFT_TABLE_NAME" &>/dev/null; then
     _nft_load_rules
@@ -3126,8 +3226,10 @@ do_mosh_tmux_install() {
     pkg_mgr="dnf"
   elif command -v yum &>/dev/null; then
     pkg_mgr="yum"
+  elif command -v apk &>/dev/null; then
+    pkg_mgr="apk"
   else
-    echo -e "${C_RED}未检测到支持的包管理器（apt/dnf/yum），无法自动安装${C_RESET}"
+    echo -e "${C_RED}未检测到支持的包管理器（apt/dnf/yum/apk），无法自动安装${C_RESET}"
     return 1
   fi
 
@@ -3137,6 +3239,7 @@ do_mosh_tmux_install() {
     apt) apt-get update -qq && apt-get install -y mosh ;;
     dnf) dnf install -y mosh ;;
     yum) yum install -y mosh ;;
+    apk) apk add --no-cache mosh ;;
   esac
   if command -v mosh &>/dev/null; then
     echo -e "${C_GREEN}✔ Mosh 安装成功：$(mosh --version 2>&1 | head -1)${C_RESET}"
@@ -3154,6 +3257,7 @@ do_mosh_tmux_install() {
     apt) apt-get install -y tmux ;;
     dnf) dnf install -y tmux ;;
     yum) yum install -y tmux ;;
+    apk) apk add --no-cache tmux ;;
   esac
   if command -v tmux &>/dev/null; then
     echo -e "${C_GREEN}✔ tmux 安装成功：$(tmux -V)${C_RESET}"
