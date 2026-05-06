@@ -4,3 +4,4 @@ CLAUDE.md
 /.serena/
 .worktrees/
 .worktrees
+.git-relay.conf
